@@ -1,0 +1,19 @@
+name: echo-mate-rv1106
+
+services:
+  sdk:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: echo-mate-rv1106-dev:ubuntu22.04-amd64
+    stdin_open: true
+    tty: true
+    working_dir: /workspace/Echo-Mate
+    volumes:
+      - echo-mate-sdk:/workspace
+      - .:/host-project:ro
+
+volumes:
+  echo-mate-sdk:
+    name: echo-mate-sdk

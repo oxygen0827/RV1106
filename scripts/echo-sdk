@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+COMPOSE_FILE="${PROJECT_DIR}/compose.yaml"
+ECHO_MATE_REPOSITORY="https://github.com/No-Chicken/Echo-Mate.git"
+ECHO_MATE_REF="${ECHO_MATE_REF:-b7a9f31e2d1e4407b89e0bfe5db0ad78678b96a9}"
+
+compose() {
+  docker compose -f "${COMPOSE_FILE}" "$@"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/echo-sdk COMMAND [ARGUMENTS]
+
+Commands:
+  build-image        Build the Ubuntu 22.04 amd64 development image.
+  init               Clone the pinned complete repository into the Linux volume.
+  check              Verify architecture, source, submodules, LFS, and toolchain.
+  status             Show the persistent volume and pinned source revisions.
+  shell              Open a shell in the persistent SDK workspace.
+  lunch              Run the SDK board-selection menu.
+  sdk [ARGS...]      Run build.sh with optional arguments; no arguments builds all.
+  exec COMMAND...    Run an arbitrary command from the Echo-Mate repository root.
+EOF
+}
+
+case "${1:-}" in
+  build-image)
+    compose build sdk
+    ;;
+  init)
+    compose run --rm \
+      -e ECHO_MATE_REPOSITORY="${ECHO_MATE_REPOSITORY}" \
+      -e ECHO_MATE_REF="${ECHO_MATE_REF}" \
+      sdk bash -lc '
+        set -euo pipefail
+        if [[ ! -d /workspace/Echo-Mate/.git ]]; then
+          git clone "${ECHO_MATE_REPOSITORY}" /workspace/Echo-Mate
+        fi
+        cd /workspace/Echo-Mate
+        git fetch origin "${ECHO_MATE_REF}"
+        git checkout --detach "${ECHO_MATE_REF}"
+        git lfs install --local
+        git lfs pull
+        git submodule sync --recursive
+        git submodule update --init --recursive
+        git submodule foreach --recursive git lfs pull
+      '
+    ;;
+  check)
+    compose run --rm sdk bash -lc '
+      set -euo pipefail
+      test "$(uname -m)" = x86_64
+      test -d /workspace/Echo-Mate/.git
+      cd /workspace/Echo-Mate
+      test -z "$(git submodule status --recursive | sed -n "/^-/p")"
+      git lfs fsck
+      compiler=SDK/rv1106-sdk/tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf/bin/arm-rockchip830-linux-uclibcgnueabihf-gcc
+      test -x "${compiler}"
+      "${compiler}" --version | head -n 1
+      test -x SDK/rv1106-sdk/build.sh
+      test -f SDK/rv1106-sdk/project/cfg/BoardConfig_IPC/BoardConfig-SD_CARD-Buildroot-RV1106_Echo_Mate-DeskMate.mk
+      test -f SDK/rv1106-sdk/project/cfg/BoardConfig_IPC/BoardConfig-SPI_NAND-Buildroot-RV1106_Echo_Mate-DeskMate.mk
+      printf "Echo-Mate commit: %s\n" "$(git rev-parse HEAD)"
+      printf "Container: %s %s\n" "$(. /etc/os-release && printf "%s" "${PRETTY_NAME}")" "$(uname -m)"
+    '
+    ;;
+  status)
+    docker volume inspect echo-mate-sdk --format 'Volume: {{.Name}} -> {{.Mountpoint}}'
+    compose run --rm sdk bash -lc '
+      set -e
+      cd /workspace/Echo-Mate
+      printf "Echo-Mate: %s\n" "$(git rev-parse HEAD)"
+      git submodule status --recursive
+      du -sh /workspace/Echo-Mate
+    '
+    ;;
+  shell)
+    compose run --rm sdk bash
+    ;;
+  lunch)
+    compose run --rm sdk bash -lc 'cd SDK/rv1106-sdk && ./build.sh lunch'
+    ;;
+  sdk)
+    shift
+    quoted_args=()
+    for arg in "$@"; do
+      printf -v quoted '%q' "${arg}"
+      quoted_args+=("${quoted}")
+    done
+    compose run --rm sdk bash -lc "cd SDK/rv1106-sdk && ./build.sh ${quoted_args[*]}"
+    ;;
+  exec)
+    shift
+    if [[ "$#" -eq 0 ]]; then
+      usage
+      exit 2
+    fi
+    quoted_args=()
+    for arg in "$@"; do
+      printf -v quoted '%q' "${arg}"
+      quoted_args+=("${quoted}")
+    done
+    compose run --rm sdk bash -lc "${quoted_args[*]}"
+    ;;
+  *)
+    usage
+    [[ -n "${1:-}" ]] && exit 2
+    ;;
+esac

@@ -1,0 +1,13 @@
+.DS_Store
+
+# 上游 SDK 与第三方资料快照（体积大，不入库）
+reference/
+upstream/
+githubdoc/
+tmp/
+
+# 构建输出
+build/
+out/
+*.o
+*.a
