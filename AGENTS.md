@@ -20,6 +20,16 @@
 
 不确定项必须从实机、原理图、设备树或当前 SDK 配置确认，不能从类似开发板猜测。
 
+### 实机确认（2026-08-07，SPI NAND 启动）
+
+- 内核：Linux 5.10.110，2026-03-29 构建，armv7l。
+- 启动介质：SPI NAND（`androidboot.storagemedia=mtd`，UBIFS；rootfs 约 181 MB，可用约 102 MB）。
+- 屏幕：`/dev/fb0` = `fb_st7789v`，当前 fb 模式 320x240 @ RGB565（240x320 旋转 270 度）；背光 `/sys/class/backlight/backlight`，`brightness=50 / max=99`。
+- 触摸：`fts_ts`（FT6336U，I2C3 @ 0x38）为 `event0`；`adc-keys`（板上按键）为 `event1`。
+- 音频：`card 0: rv-acodec`（RV1106 内置 ACodec，`ffae0000.i2s` + `ff480000.acodec`），playback + capture 均已枚举。
+- 喇叭验证通过：`aplay` 播放 16 kHz 单声道 WAV 正常（exit 0）；音量控制在 `DAC LINEOUT Volume`。
+- 屏幕验证通过：向 `/dev/fb0` 写 153600 字节整帧可显示纯色；写入方式为一次 `cat file > /dev/fb0`，不要用无限写入命令。
+
 ## 权威顺序
 
 遇到冲突时按以下顺序处理并记录差异：
@@ -40,6 +50,20 @@
 - 当前 macOS SDK 检出仅用于阅读。Linux kernel 源码含仅大小写不同的文件，大小写不敏感文件系统会让 Git 显示伪修改/覆盖；正式构建必须在 Ubuntu 22.04 的区分大小写文件系统重新克隆。
 - 完整 SDK 和目标程序交叉编译必须在 `linux/amd64` Ubuntu 22.04 容器内执行，不直接使用 macOS 检出目录构建。
 - 不提交镜像、模型、构建输出或第三方大文件，除非仓库策略明确允许。
+
+## 板端访问（macOS 实机）
+
+- 板子 Type-C 直连 Mac 后枚举为 Rockchip USB gadget：`rk3xxx`，带 RNDIS 网卡 + ADB 接口，序列号即 ADB 设备号（如 `f95be6ec9d1c67fa`）。
+- **macOS 26 不支持 RNDIS 驱动**，所以官方文档的 USB 虚拟网卡 `172.32.0.93` SSH/SCP 在 macOS 上不可用。
+- 在 macOS 上进板子的可用通道是 **ADB**：`brew install android-platform-tools`，然后：
+  ```sh
+  adb shell            # 进板子 shell
+  adb push <local> <remote>   # 传文件到板子
+  adb pull <remote> <local>   # 拉取文件
+  ```
+- `adb shell` 登录身份为 root，可执行 `aplay`、`amixer`、`cat /sys/...` 等。
+- **Wi-Fi 已验证（2026-08-07）**：板子已配好 LDKJ（WPA2），DHCP IP 为 `192.168.31.240`，与 Mac 同网段；可用 `ssh root@192.168.31.240`（密码 root）。DHCP 分配，IP 可能变化，用 `adb shell ip addr show wlan0` 现查。配置见 `docs/dev-experience.md`「板子 Wi-Fi 联网配置」。
+- 其它登录途径（USB-TTL 串口 115200、Wi-Fi SSH root/root）中 Wi-Fi SSH 已随上一条实测可用；USB-TTL 未验证，需要时再单独确认。
 
 ## 安全约束
 

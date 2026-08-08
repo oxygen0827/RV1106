@@ -10,6 +10,9 @@ services:
     stdin_open: true
     tty: true
     working_dir: /workspace/Echo-Mate
+    environment:
+      - http_proxy=http://host.docker.internal:7897
+      - https_proxy=http://host.docker.internal:7897
     volumes:
       - echo-mate-sdk:/workspace
       - .:/host-project:ro

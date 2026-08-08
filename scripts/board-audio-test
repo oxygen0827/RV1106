@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "${TMP}"' EXIT
+
+DUR="${DUR:-5}"
+DIG_VOL="${DIG_VOL:-185}"
+LINEOUT_VOL="${LINEOUT_VOL:-20}"
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/board-audio-test [DURATION]
+
+Verifies the Echo-Mate microphone + speaker path over ADB.
+
+Environment:
+  DUR         recording seconds (default 5)
+  DIG_VOL     ADC Digital Volume for both channels (default 185)
+  LINEOUT_VOL DAC LINEOUT Volume for the beep prompt (default 20)
+
+Flow: configure ADC to single-ended -> play beep -> record -> analyze energy.
+EOF
+}
+
+require_device() {
+  if ! adb devices | grep -qw device; then
+    echo "error: no ADB device. Plug in the board and run 'adb devices'." >&2
+    exit 1
+  fi
+}
+
+gen_beep() {
+  python3 - <<'PY'
+import wave, struct, math
+sr = 16000; dur = 0.4; amp = 0.5
+w = wave.open('beep.wav', 'wb')
+w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+for i in range(int(sr * dur)):
+    v = int(amp * 32767 * math.sin(2 * math.pi * 1200 * i / sr))
+    w.writeframes(struct.pack('<h', v))
+w.close()
+PY
+}
+
+analyze() {
+  python3 - "$1" "$DUR" <<'PY'
+import wave, struct, math, sys
+path, dur = sys.argv[1], float(sys.argv[2])
+w = wave.open(path, 'rb')
+n = w.getnframes(); sr = w.getframerate()
+raw = w.readframes(n)
+d = [struct.unpack('<h', raw[i:i+2])[0] for i in range(0, len(raw) - 1, 2)]
+peak = max(abs(x) for x in d)
+clip = sum(1 for x in d if abs(x) >= 32000)
+rms = math.sqrt(sum(x * x for x in d) / len(d))
+db = 20 * math.log10(peak / 32767) if peak else -120
+print(f"duration={n/sr:.2f}s peak={peak} ({db:.1f} dBFS) rms={rms:.1f} clipped_samples={clip}")
+for i in range(math.ceil(len(d) / (sr // 10))):
+    seg = d[i * sr // 10:(i + 1) * sr // 10]
+    if not seg:
+        continue
+    p = max(abs(x) for x in seg)
+    r = math.sqrt(sum(x * x for x in seg) / len(seg))
+    if r > 50:
+        print(f"  {i*0.1:4.1f}s peak={p:6d} rms={r:6.1f} {'#' * min(50, int(r / 500))}")
+PY
+}
+
+[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage; exit 0; }
+[[ -n "${1:-}" ]] && DUR="$1"
+
+require_device
+
+echo "configuring ADC (single-ended, digital vol=$DIG_VOL) ..."
+adb shell "amixer -c 0 cset numid=19 1 >/dev/null 2>&1 || true"
+adb shell "amixer -c 0 cset numid=6 ${DIG_VOL} >/dev/null 2>&1 || true"
+adb shell "amixer -c 0 cset numid=7 ${DIG_VOL} >/dev/null 2>&1 || true"
+adb shell "amixer -c 0 cset numid=24 ${LINEOUT_VOL} >/dev/null 2>&1 || true"
+
+cd "${TMP}"
+gen_beep
+adb push beep.wav /data/beep.wav >/dev/null 2>&1
+adb shell "aplay -D plughw:0,0 /data/beep.wav >/dev/null 2>&1"
+echo "beep played; recording ${DUR}s in 2s -- SPEAK NOW"
+sleep 2
+adb shell "arecord -D plughw:0,0 -f S16_LE -r 16000 -c 1 -d ${DUR} /data/rec.wav >/dev/null 2>&1"
+adb pull /data/rec.wav ./rec.wav >/dev/null 2>&1
+adb shell "rm -f /data/rec.wav /data/beep.wav >/dev/null 2>&1 || true"
+
+echo "== result =="
+analyze ./rec.wav

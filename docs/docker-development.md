@@ -23,6 +23,13 @@
 ./scripts/echo-sdk shell
 ```
 
+首次初始化默认选择 Echo-Mate 的 SD Card + Buildroot 基线。切换存储介质时使用：
+
+```bash
+./scripts/echo-sdk configure-sd
+./scripts/echo-sdk configure-nand
+```
+
 SDK 选板和构建：
 
 ```bash
@@ -56,3 +63,16 @@ docker volume inspect echo-mate-sdk
 ```
 
 volume 是唯一的可编译 SDK 副本。删除 `echo-mate-sdk` 会同时删除源码、构建缓存和输出，因此不要把 `docker volume rm` 或 `docker compose down -v` 当作普通清理命令。
+
+## 已验证基线
+
+2026-08-07 在 Apple Silicon Mac + Docker Desktop 上完成以下验证：
+
+- 容器：Ubuntu 22.04.3 LTS、`x86_64`。
+- Echo-Mate：`b7a9f31e2d1e4407b89e0bfe5db0ad78678b96a9`。
+- Demo 及全部递归子模块已初始化，`git lfs fsck` 通过。
+- RV1106 交叉编译器：GCC 8.3.0，SDK 官方 `build.sh check` 全部通过。
+- 构建配置：Echo-Mate、SD Card、Buildroot、`rv1106g-echo-mate.dts`。
+- `./scripts/echo-sdk sdk kernel` 构建成功；`output/image/boot.img` 已生成。
+
+本次只用内核构建验证开发环境，没有预先执行 U-Boot、Buildroot rootfs 和完整固件的一键构建。需要完整重编镜像时执行 `./scripts/echo-sdk sdk`。

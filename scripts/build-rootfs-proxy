@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+COMPOSE_FILE="${PROJECT_DIR}/compose.yaml"
+
+# 宿主代理端口；不可用时回退直连
+PROXY_HOST="${HOST_PROXY_HOST:-host.docker.internal}"
+PROXY_PORT="${HOST_PROXY_PORT:-7897}"
+
+PROXY_SETUP='printf "use_proxy = yes\nhttp_proxy = http://'"${PROXY_HOST}"':'"${PROXY_PORT}"'\nhttps_proxy = http://'"${PROXY_HOST}"':'"${PROXY_PORT}"'\n" > /etc/wgetrc && echo "wget proxy configured: '"${PROXY_HOST}"':'"${PROXY_PORT}"'"'
+
+run() {
+  docker compose -f "${COMPOSE_FILE}" run --rm \
+    -e "http_proxy=http://${PROXY_HOST}:${PROXY_PORT}" \
+    -e "https_proxy=http://${PROXY_HOST}:${PROXY_PORT}" \
+    sdk bash -lc "set -e; ${PROXY_SETUP}; $1"
+}
+
+run "cd SDK/rv1106-sdk && ./build.sh rootfs"

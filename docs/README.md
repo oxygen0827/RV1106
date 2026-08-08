@@ -4,5 +4,6 @@
 - [首次上板与恢复](board-bringup.md)
 - [软件架构与 AI 开发方法](software-architecture-and-vibecoding.md)
 - [Docker 开发环境](docker-development.md)
+- [开发经验记录](dev-experience.md)
 
 阅读顺序：先硬件参考，再完成首次上板，最后进入软件架构和功能开发。

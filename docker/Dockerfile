@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 luckfoxtech/luckfox_pico:1.0
+FROM luckfoxtech/luckfox_pico:1.0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
@@ -8,6 +8,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         cmake \
+        curl \
         git-lfs \
         libboost-all-dev \
         libcurl4-openssl-dev \
@@ -25,6 +26,10 @@ RUN apt-get update \
     && git lfs install --system \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# 容器内所有 wget 走宿主代理（host.docker.internal 由 Docker Desktop 提供）
+# 代理端口不可用时保持直连，避免影响离线场景
+RUN printf "use_proxy = yes\nhttp_proxy = http://host.docker.internal:7897\nhttps_proxy = http://host.docker.internal:7897\n" >> /etc/wgetrc
 
 WORKDIR /workspace/Echo-Mate
 

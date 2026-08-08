@@ -22,6 +22,8 @@ Commands:
   status             Show the persistent volume and pinned source revisions.
   shell              Open a shell in the persistent SDK workspace.
   lunch              Run the SDK board-selection menu.
+  configure-sd       Select Echo-Mate Buildroot on SD Card.
+  configure-nand     Select Echo-Mate Buildroot on SPI NAND.
   sdk [ARGS...]      Run build.sh with optional arguments; no arguments builds all.
   exec COMMAND...    Run an arbitrary command from the Echo-Mate repository root.
 EOF
@@ -48,6 +50,9 @@ case "${1:-}" in
         git submodule sync --recursive
         git submodule update --init --recursive
         git submodule foreach --recursive git lfs pull
+        if [[ ! -e SDK/rv1106-sdk/.BoardConfig.mk ]]; then
+          printf "7\n0\n0\n" | (cd SDK/rv1106-sdk && ./build.sh lunch)
+        fi
       '
     ;;
   check)
@@ -64,6 +69,7 @@ case "${1:-}" in
       test -x SDK/rv1106-sdk/build.sh
       test -f SDK/rv1106-sdk/project/cfg/BoardConfig_IPC/BoardConfig-SD_CARD-Buildroot-RV1106_Echo_Mate-DeskMate.mk
       test -f SDK/rv1106-sdk/project/cfg/BoardConfig_IPC/BoardConfig-SPI_NAND-Buildroot-RV1106_Echo_Mate-DeskMate.mk
+      (cd SDK/rv1106-sdk && ./build.sh check)
       printf "Echo-Mate commit: %s\n" "$(git rev-parse HEAD)"
       printf "Container: %s %s\n" "$(. /etc/os-release && printf "%s" "${PRETTY_NAME}")" "$(uname -m)"
     '
@@ -83,6 +89,12 @@ case "${1:-}" in
     ;;
   lunch)
     compose run --rm sdk bash -lc 'cd SDK/rv1106-sdk && ./build.sh lunch'
+    ;;
+  configure-sd)
+    compose run --rm sdk bash -lc 'printf "7\n0\n0\n" | (cd SDK/rv1106-sdk && ./build.sh lunch)'
+    ;;
+  configure-nand)
+    compose run --rm sdk bash -lc 'printf "7\n1\n0\n" | (cd SDK/rv1106-sdk && ./build.sh lunch)'
     ;;
   sdk)
     shift

@@ -111,13 +111,42 @@ arecord -l
 amixer -c 0 contents
 ```
 
-官方常用扬声器 control：
+声卡是 `card 0: rv-acodec`（RV1106 内置 ACodec，`ffae0000.i2s` + `ff480000.acodec`），playback 和 capture 都在 `device 0`。
+
+### 实机确认的控件（numid）
+
+Rockchip ASoC 的控件没有注册为 simple control，`sget`/`sset` 按名字查不到，要用 `cset` 加 numid：
+
+| 用途 | 控件 | numid | 实机推荐值 |
+| --- | --- | --- | --- |
+| 喇叭音量 | DAC LINEOUT Volume | 24 | 20/30（提示音足够响） |
+| 耳机混合 | DAC HPMIX Volume | 25 | 默认 |
+| MIC 输入模式 | ADC Mode | 19 | `SingadcL`（单端，默认 `DiffadcL` 信号弱 3-5 倍） |
+| MIC 通道开关 | ADC MIC Left/Right Switch | 22/23 | `Work` |
+| MIC 增益 | ADC MIC Left/Right Gain | 2/3 | 3（最大） |
+| MICBIAS | ADC Main MICBIAS / Voltage | 21/20 | On / 默认 |
+| ADC 数字音量 | ADC Digital Left/Right Volume | 6/7 | 185（0.5dB/步） |
+
+注意 ADC 数字音量步进是 0.5 dB/步：从 211 降到 160 约 -25 dB，会连底噪一起压没；200 以上大声会削波。185 左右正常说话约 -12 dBFS。
+
+录音命令（16 kHz、16-bit、单声道）：
 
 ```sh
-amixer -c 0 cset name='DAC LINEOUT Volume' 18
+arecord -D plughw:0,0 -f S16_LE -r 16000 -c 1 -d 5 /data/rec.wav
 ```
 
-RK MPI 参考命令使用 16 kHz、16-bit PCM。测试前确认喇叭/MIC 接口和 PA 状态，音量从低值开始。录音后把 PCM 拉回电脑做波形、峰值、直流偏置和底噪检查，不能只凭“文件存在”判定成功。
+### 一键调测
+
+宿主侧脚本会设置单端模式 + 音量、播放提示音、录音并分析能量：
+
+```sh
+./scripts/board-audio-test 5      # 录 5 秒；听到哔声后说话
+DIG_VOL=185 LINEOUT_VOL=20 ./scripts/board-audio-test 5
+```
+
+提示音先响、停顿 2 秒才开始录音，方便测试者开口；喇叭音量太低时提示音听不见。
+
+录音后把 PCM 拉回电脑做波形、峰值、直流偏置和底噪检查，不能只凭“文件存在”判定成功。测试前确认喇叭/MIC 接口和 PA 状态，音量从低值开始。
 
 ## 7. 运行预编译 DeskBot
 
