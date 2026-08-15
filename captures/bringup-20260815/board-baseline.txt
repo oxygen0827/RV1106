@@ -1,0 +1,45 @@
+Linux root 5.10.110 #45 Wed Apr 9 17:33:31 CST 2025 armv7l GNU/Linux
+user_debug=31 storagemedia=mtd androidboot.storagemedia=mtd androidboot.mode=normal  rootwait earlycon=uart8250,mmio32,0xff4c0000 console=ttyFIQ0 snd_soc_core.prealloc_buffer_size_kbytes=16 coherent_pool=0 ubi.mtd=6 root=ubi0:rootfs rootfstype=ubifs rk_dma_heap_cma=66M mtdparts=spi-nand0:256K(env),256K@256K(idblock),512K(uboot),4M(boot),30M(oem),10M(userdata),210M(rootfs)
+MemTotal:          55728 kB
+dev:    size   erasesize  name
+mtd0: 00040000 00020000 "env"
+mtd1: 00040000 00020000 "idblock"
+mtd2: 00080000 00020000 "uboot"
+mtd3: 00400000 00020000 "boot"
+mtd4: 01e00000 00020000 "oem"
+mtd5: 00a00000 00020000 "userdata"
+mtd6: 0d200000 00020000 "rootfs"
+ubi0:rootfs on / type ubifs (rw,relatime,assert=read-only,ubi=0,vol=0)
+/dev/ubi4_0 on /oem type ubifs (rw,relatime,assert=read-only,ubi=4,vol=0)
+/dev/ubi5_0 on /userdata type ubifs (rw,relatime,assert=read-only,ubi=5,vol=0)
+crw-rw----    1 root     video      29,   0 Jan  1 12:00 [1;35m/dev/fb0[m
+
+/dev/input:
+total 0
+drwxr-xr-x    2 root     root            80 Jan  1 12:00 [1;34mby-path[m
+crw-------    1 root     root       13,  64 Jan  1 12:00 [1;35mevent0[m
+crw-------    1 root     root       13,  65 Jan  1 12:00 [1;35mevent1[m
+
+/dev/snd:
+total 0
+drwxr-xr-x    2 root     root            60 Jan  1 12:00 [1;34mby-path[m
+crw-rw----    1 root     audio     116,   0 Jan  1 12:00 [1;35mcontrolC0[m
+crw-rw----    1 root     audio     116,  24 Jan  1 12:00 [1;35mpcmC0D0c[m
+crw-rw----    1 root     audio     116,  16 Jan  1 12:00 [1;35mpcmC0D0p[m
+fb_st7789v
+99
+50
+**** List of PLAYBACK Hardware Devices ****
+card 0: rvacodec [rv-acodec], device 0: ffae0000.i2s-rv1106-hifi ff480000.acodec-0 [ffae0000.i2s-rv1106-hifi ff480000.acodec-0]
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+**** List of CAPTURE Hardware Devices ****
+card 0: rvacodec [rv-acodec], device 0: ffae0000.i2s-rv1106-hifi ff480000.acodec-0 [ffae0000.i2s-rv1106-hifi ff480000.acodec-0]
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+r8723bs               347272  0 
+cfg80211              168521  1 r8723bs
+rknpu                  22683  0 
+mpp_vcodec            375759  1 rockit
+rga3                   87738  1 rockit
+rk_dvbm                 5813  2 mpp_vcodec,video_rkisp

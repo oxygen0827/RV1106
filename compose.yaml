@@ -11,8 +11,8 @@ services:
     tty: true
     working_dir: /workspace/Echo-Mate
     environment:
-      - http_proxy=http://host.docker.internal:7897
-      - https_proxy=http://host.docker.internal:7897
+      - PROXY_HOST=${PROXY_HOST:-host.docker.internal}
+      - PROXY_PORT=${PROXY_PORT:-7897}
     volumes:
       - echo-mate-sdk:/workspace
       - .:/host-project:ro

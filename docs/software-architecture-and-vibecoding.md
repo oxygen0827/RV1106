@@ -14,7 +14,7 @@ Echo-Mate hardware
        -> YOLO camera -> opencv-mobile/RKNN
 ```
 
-RV1106 只有单核 A7 和 256 MB 内存。板端适合显示、触摸、唤醒词、Opus、简单业务逻辑和量化视觉模型；ASR、LLM 和 TTS 默认放在电脑/服务器。后续接入新的大模型时，优先替换 Server 服务，不要先把模型塞进板端。
+RV1106 只有单核 A7 和 256 MB 内存。板端适合显示、触摸、唤醒词、Opus、简单业务逻辑和量化视觉模型；语音理解和生成默认放在电脑/服务器。当前 AIChat 使用 VAD 分段和智谱 `GLM-4-Voice` 端到端处理，板端继续只负责 16 kHz Opus 采集/播放。
 
 ## 源码导航
 
@@ -31,7 +31,7 @@ RV1106 只有单核 A7 和 256 MB 内存。板端适合显示、触摸、唤醒�
 `upstream/Demo4Echo/AIChat_demo/`：
 
 - `Client/`：状态机、音频、WebSocket、意图注册和 C 接口。
-- `Server/`：鉴权、VAD、ASR、LLM、TTS、任务和 WebSocket 服务。
+- `Server/`：鉴权、VAD、GLM-4-Voice 适配、音频格式转换、任务和 WebSocket 服务。
 
 `upstream/Demo4Echo/yolov5_demo/`：RKNN 模型、RGA、opencv-mobile 采集和后处理。
 
@@ -83,7 +83,7 @@ Echo 专用 SDK 入口：
 
 ## AIChat 协议
 
-客户端连接 Server 时带 Bearer token、Device-Id 和 Protocol-Version；随后发送 `hello`，声明 Opus、16 kHz、单声道和 40 ms 帧。音频二进制头包含 version、type 和 payload size；状态、ASR、VAD、TTS、chat 和 function call 使用 JSON。
+客户端连接 Server 时带 Bearer token、Device-Id 和 Protocol-Version；随后发送 `hello`，声明 Opus、16 kHz、单声道和 40 ms 帧。音频二进制头包含 version、type 和 payload size；状态、voice、VAD、chat 和 function call 使用 JSON。Server 在 VAD 结束后将 PCM 封装 WAV 调用 GLM-4-Voice，解析返回 WAV 并重采样到 16 kHz，再按 40 ms Opus 包发送。
 
 推荐把意图能力做成小而明确的函数：
 
@@ -103,6 +103,8 @@ Echo 专用 SDK 入口：
 | 配置文件 | 包内示例 key | 源码模板含看起来可用的 key |
 
 开发时选择一套 client/server commit，并把协议版本、端口、模型版本和配置 schema 一起记录。出现“连不上”时先验证这一矩阵，再排查 Wi-Fi。
+
+当前修复分支规定云端凭据只存在于 Server 运行环境：`ZHIPU_API_KEY` 用于 `glm-4-voice`，32-64 字符随机 `AICHAT_ACCESS_TOKEN` 用于 Client/Server 鉴权。Client 不通过 `hello` 传 key，Server 也不接受 Client 覆盖云端凭据。缺少语音服务或云端返回非法音频时返回 protocol `error`，不能静默停在 thinking 状态。
 
 上游配置中存在硬编码 API key。它们应视为已泄露：
 

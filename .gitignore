@@ -11,3 +11,6 @@ build/
 out/
 *.o
 *.a
+
+# frp 客户端工具（二进制不入库）
+.tools/

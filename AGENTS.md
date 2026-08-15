@@ -29,6 +29,7 @@
 - 音频：`card 0: rv-acodec`（RV1106 内置 ACodec，`ffae0000.i2s` + `ff480000.acodec`），playback + capture 均已枚举。
 - 喇叭验证通过：`aplay` 播放 16 kHz 单声道 WAV 正常（exit 0）；音量控制在 `DAC LINEOUT Volume`。
 - 屏幕验证通过：向 `/dev/fb0` 写 153600 字节整帧可显示纯色；写入方式为一次 `cat file > /dev/fb0`，不要用无限写入命令。
+- 当前固件的 `/proc/iomem` 与设备树只向 Linux 映射 128 MB RAM，启动参数另预留 66 MB CMA，故 `MemTotal` 约 55 MB；这与资料标注的 256 MB 不一致，物理 DDR 容量需结合芯片/DDR 丝印、bootloader 和设备树继续确认。
 
 ## 权威顺序
 
@@ -87,6 +88,7 @@
 - 2025-06-27 预编译 `bin` 使用 AIChat 端口 `8765`、协议 `1`。
 - 当前 Demo4Echo 源码配置使用端口 `8000`、协议 `2`。
 - 客户端、服务端、`system_para.conf` 必须成套，禁止混用后只排查网络。
+- 当前 AIChat 修复分支使用端口 8000、协议 2；`GLM-4-Voice` 只从电脑端 `ZHIPU_API_KEY` 读取，鉴权使用随机 `AICHAT_ACCESS_TOKEN`。Client 不得发送或覆盖云端 key，缺配置或云端音频非法时必须返回明确 protocol error。
 - 文档写 `conf/dev_conf`，当前源码实际是 `conf/dev_conf.h`。
 - `toolchain.cmake` 含作者本机绝对 SDK 路径，构建前必须改为本机路径或改造成可配置变量。
 - Echo Buildroot 板级配置只有两条正式基线：`BoardConfig-SD_CARD-Buildroot-RV1106_Echo_Mate-DeskMate.mk` 和 `BoardConfig-SPI_NAND-Buildroot-RV1106_Echo_Mate-DeskMate.mk`；不要误选 Luckfox Pico 配置。
