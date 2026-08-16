@@ -303,6 +303,70 @@
   已有、AIChat 链路已验证，需软件方在 clare-voice-api 协议上支持 Opus
   解码（新增讨论议题）。
 
+## 2026-08-16：meeting_demo 桌面图标与启动页（DeskBot 集成）
+
+- 现象：meeting_demo 是控制台程序，测试必须走 ADB 前台 shell，屏幕上没有入口。
+- 解决：给 DeskBot 桌面加「会议」图标 + MeetingDemoPage：
+  1. 新页面 `apps/meeting-demo/deskbot-ui/ui_MeetingDemoPage.{c,h}`（不改 upstream）：
+     页面初始「未开始」，点击全宽「开启会议」按钮后 fork/exec
+     `/root/meeting_demo/meeting-demo-run.sh`（stdin/stdout 管道），
+     读线程收行进环形缓冲，300ms LVGL 定时器刷新转写文本区（流式显示）；
+     触屏按钮写 stdin：按住提问=Enter×2、打断=s、退出=q；进程退出后
+     按钮重新出现可再开新一轮。
+  2. `ui.c.diff`/`ui_HomePage.c.diff` 幂等注册页面、把死掉的 Memo 占位图标
+     换成会议图标（MemoPage 从未注册，点它本来就无反应）。
+  3. `scripts/build-deskbot-meeting`（容器内交叉编译，导出 tar.gz 排除
+     system_para.conf）、`scripts/deploy-deskbot-meeting`（备份/解包/重启/校验）。
+- 踩坑：
+  1. GNU patch 对 hunk 计数严格（busybox patch 宽松），手写 diff 的
+     +行数、后续 hunk 的 +行号都要精确，否则 "malformed patch"。
+  2. 板端 busybox tar 无 `-z` 且 `-a` 不解压，解包用
+     `gzip -dc file.tar.gz | tar x`。
+  3. 板端 rootfs 只剩 ~2MB：旧 main 备份改为 `adb pull` 到 Mac
+     （`out/deskbot-meeting/rollback/main.prev-20260816`，SHA
+     f60e2d90…，回滚时 push 回去即可）。
+  4. 包装脚本没有 exec，进程树是 sh → meeting_demo：只 kill sh 会把
+     meeting_demo 变孤儿。子进程必须 `setpgid(0,0)` 自成进程组，
+     兜底用 `kill(-pid, SIGTERM/SIGKILL)`。
+  5. 退出尾部 `/api/session/end` HTTP 对真实服务端要 5~15s（板端 Wi-Fi
+     上行慢 + 服务端收尾转写），页面等待预算只给 4s，超时按组 TERM——
+     服务端已收到请求会自行收尾，无残留进程（冒烟测试验证
+     group_gone=1 orphan=0）。
+- 验证：`apps/meeting-demo/tests/deskbot-launcher-smoke.c`（复刻页面
+  启动器链路，板端实测 PASS：会话创建、转写推流、Enter/s/q 控制、
+  无孤儿）；桌面绿色「会议」图标经 fb 像素校验（RGB565 大端序，
+  0x2BEB=0x2E7D5B）1428 绿像素渲染确认；main SHA 08e55996…。
+- 待办：图标点击进入页面的触屏链路需实机点按验收（触摸节点不接受
+  userspace 注入，I2C 模拟又依赖 INT 引脚不可行，不做）。
+- 相关文件/命令：`scripts/build-deskbot-meeting`、
+  `scripts/deploy-deskbot-meeting`、`apps/meeting-demo/deskbot-ui/`。
+
+## 2026-08-16：meeting_demo 页面满屏「口」——DeskBot 字库是子集字库
+
+- 现象：MeetingDemoPage 上线后文案与转写文本大量显示「口」（缺字形方块）。
+- 排查：
+  1. DeskBot 自带的 heiti14/heiti22 是 SquareLine 按上游页面文本裁剪的
+     **子集字库**：CJK 区间（0x4E00-0x9ED2）用的是 SPARSE_TINY 稀疏映射，
+     heiti14 实际只有 104 个汉字（日期/节日/天气词），我的「会议纪要/
+     按住提问/打断」和转写文本绝大多数字符都不在子集里。全角标点
+     （：（）【】）也不在。LVGL 9 对缺字形渲染成「□」。
+  2. 生成新字库：lv_font_conv 1.5.2 + Source Han Sans SC Medium
+     （与上游黑体同源），字符集 = ASCII + GB2312 区1-9 符号 + 区16-55
+     一级汉字 3755 个 + 常用标点，共 4535 字。
+     - `ui_font_meeting14.c`（4bpp 14px，~470KB 二进制，转写文本用）
+     - `ui_font_meeting22.c`（4bpp 22px，仅 UI 文案，标题/图标用）
+  3. lv_font_conv 1.5.2 按 LVGL8 生成：`LV_VERSION_CHECK` 宏 LVGL9 已无，
+     且 LVGL9 移除了 dsc 的 `cache` 成员。必须把
+     `#if LV_VERSION_CHECK(8,0,0)` 按上下文改写：cache 相关 →
+     `LVGL_VERSION_MAJOR == 8`，const 字体定义 → `>= 8`（构建脚本内
+     已用 python 归一化，幂等）。
+  4. GNU patch 2.7.6 对 `gui_app/ui.h` 的匹配异常（目标行与 hunk 字节级
+     一致仍报 Hunk FAILED，原因未明）；ui.h 的字体声明改用 sed 注入。
+- 解决后的图标「会议」两字经 fb 像素校验渲染为真实笔画（白色字形像素
+  出现在绿色按钮内）；main 从 10.04MB 增至 10.51MB（+470KB 字库）。
+- 相关文件/命令：`apps/meeting-demo/deskbot-ui/fonts/`（OTF + 生成脚本
+  `gen_font_chars.py`）、`scripts/build-deskbot-meeting`（同步+归一化）。
+
 ## 2026-08-16：板端 wss/TLS 链路验证矩阵 + 喇叭声学回环
 
 - wss 验证（`apps/meeting-demo/tls_probe`，板端实测）：
@@ -315,3 +379,22 @@
 - 喇叭声学回环：板端 `arecord`(16k) 同时 `aplay` 24kHz PCM，录音与所播
   音频互相关峰值/噪声基线 = **194×**（lag 0.9s 处），证明 MP3 解码→
   24kHz ALSA→喇叭的物理出声链路完整。
+
+## 2026-08-16：真实生产后端（clare.vinex.top/voice-api）联调验证
+
+- 生产地址：`https://clare.vinex.top/voice-api`（Cloudflare + Let's Encrypt
+  公共证书，CA bundle 直接可用）；协议为 API_DOC v2.0。
+- 板端全链路验证（wss 直连生产）：
+  1. session 创建/状态/结束：全部 200，含 analysis_final；
+  2. 转写通道：二进制 PCM + VAD 上行，生产火山 ASR 转写回传
+     transcript 事件，板端实时显示（"三季度同比增长23%。"逐字中间态
+     + 最终态）；understanding 快照轮询正常；
+  3. 服务端转写通道有 keepalive ping（超时以 1011 关闭），websocketpp
+     会自动回 pong，但上行拥堵时 pong 会延迟 → 已加断线自动重连（2s）；
+  4. host 问答：JSON base64 帧在 12-24KB/s 上行下送达过慢，服务器
+     关闭握手超时（1006）——生产问答不稳定，**根因仍是上行带宽**。
+- 结论：demo 客观目标（与真实后端打通）达成；会议问答的稳定运行需要
+  Opus 压缩上行（16kbps ≈ 2KB/s，10 倍余量）——需软件方在协议支持，
+  证据链已齐（本文件前述 Wi-Fi 实测 + 本轮生产行为）。
+- 板端 DNS 偶发失败（Host not found）——understanding 轮询 5s 周期
+  天然重试，可接受。
