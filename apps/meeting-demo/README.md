@@ -31,6 +31,38 @@ ALSA 采集 16kHz/mono/s16（100ms 帧）
 `--cafile PATH`（wss 校验，默认 /root/bin/cacert.pem）、
 `--duplex-upload 0|1`（默认 0：播放回答期间暂停转写上行，半双工时序防回声）。
 
+## 屏幕入口（DeskBot 桌面图标）
+
+meeting_demo 本身是控制台程序，不出画面。桌面上给它加图标/页面的代码在
+`apps/meeting-demo/deskbot-ui/`（不修改 upstream），构建/部署流程：
+
+```sh
+./scripts/build-deskbot-meeting      # 容器内交叉编译带会议入口的 DeskBot → out/deskbot-meeting/
+./scripts/deploy-deskbot-meeting     # 备份旧 main → 替换 → 重启 → 验收
+```
+
+- 桌面第一页左下角（原 Memo 占位图标位置）出现绿色「会议」图标；
+  点击进入 MeetingDemoPage。
+- 页面初始状态为「未开始」，显示全宽绿色「开启会议」按钮；
+  点击后 fork/exec `/root/meeting_demo/meeting-demo-run.sh`（full 模式），
+  板端开始录音并推流，转写/回答文本经子进程 stdout 管道实时流式显示在
+  转写文本区（按钮自动隐藏，状态变「运行中」）。
+- 触屏按钮：`按住提问`=按住/松开各发一次 Enter、`打断`=s、`退出`=q 并返回桌面
+  （进程未运行时按提问/打断无副作用）。会议进程自行退出后状态变「已停止」，
+  「开启会议」按钮重新出现，可再次开启新会议。
+- 服务器地址优先读 `/root/meeting_demo/server.conf`（一行 ws(s)://URL），
+  缺省 `ws://192.168.31.97:8700`；板端本地 mock 时写成 `ws://127.0.0.1:8700`。
+- 部署包排除 `system_para.conf`：AIChat 令牌等板端配置不被模板覆盖；
+  旧 main 自动备份到 `out/deskbot-meeting/rollback/`（adb pull）。
+- **字库**：DeskBot 自带 heiti 字库是上游页面裁剪的子集（heiti14 仅 104 个
+  汉字），页面文案和转写文本会显示「口」。本应用自带生成字库
+  `deskbot-ui/fonts/ui_font_meeting14.c`（GB2312 一级 3755 字 + 全角标点 +
+  ASCII，转写文本用）和 `ui_font_meeting22.c`（UI 文案，标题/图标用）。
+  重新生成：`deskbot-ui/fonts/` 下运行
+  `python3 gen_font_chars.py full > chars.txt`，再
+  `lv_font_conv --no-compress --no-prefilter --bpp 4 --size 14 --font SourceHanSansSC-Medium.otf --symbols "$(cat chars.txt)" --format lvgl --lv-include "../../ui.h" -o ui_font_meeting14.c`。
+  构建脚本会自动把 LVGL8 风格的 `LV_VERSION_CHECK` 守卫归一化为 LVGL9。
+
 ## 板端实机验证（2026-08-16）
 
 - full 模式：转写持续推流 + 自动问答两轮，文本流式显示、MP3 解码播放、

@@ -21,6 +21,8 @@ struct IWsTransport {
     virtual bool start() = 0;                    // 启动内部 io 线程
     virtual bool connect(const std::string& url, const std::string& cafile) = 0;
     virtual bool send_json(const Json::Value& v) = 0;
+    // 二进制帧（API_DOC v2：转写通道推荐直接发裸 PCM bytes）
+    virtual bool send_binary(const uint8_t* data, size_t len) = 0;
     virtual bool is_open() const = 0;
     virtual void close() = 0;
     virtual void stop() = 0;
@@ -148,23 +150,35 @@ public:
         w["indentation"] = "";
         {
             std::lock_guard<std::mutex> lk(q_mutex_);
-            out_queue_.push_back(Json::writeString(w, v));
+            out_queue_.push_back({true, Json::writeString(w, v)});
         }
         // post 到 io 线程执行（io_service::post 线程安全）
         client_.get_io_service().post([this]() { flush_out_queue(); });
         return true;
     }
 
+    bool send_binary(const uint8_t* data, size_t len) override {
+        {
+            std::lock_guard<std::mutex> lk(q_mutex_);
+            out_queue_.push_back({false, std::string(reinterpret_cast<const char*>(data), len)});
+        }
+        client_.get_io_service().post([this]() { flush_out_queue(); });
+        return true;
+    }
+
     void flush_out_queue() {
-        std::vector<std::string> batch;
+        std::vector<OutFrame> batch;
         {
             std::lock_guard<std::mutex> lk(q_mutex_);
             batch.swap(out_queue_);
         }
-        for (const std::string& s : batch) {
+        for (const OutFrame& f : batch) {
             if (!open_.load()) continue;  // 未连接/已关闭时静默丢弃
             websocketpp::lib::error_code ec;
-            client_.send(hdl_, s, websocketpp::frame::opcode::text, ec);
+            client_.send(hdl_, f.data,
+                         f.text ? websocketpp::frame::opcode::text
+                                : websocketpp::frame::opcode::binary,
+                         ec);
             if (ec) LOGF("ws send: %s", ec.message().c_str());
         }
     }
@@ -195,10 +209,14 @@ public:
 private:
     // 发送编组：非 io 线程直接 send 会让 asio reactor 的异步写注册与 epoll
     // 竞争丢失（帧被无限期延迟）——统一 post 到 io 线程串行发送。
+    struct OutFrame {
+        bool text;
+        std::string data;
+    };
     Client client_;
     std::thread io_thread_;
     std::mutex q_mutex_;
-    std::vector<std::string> out_queue_;
+    std::vector<OutFrame> out_queue_;
     boost::asio::io_service::work* work_ = nullptr;
     Hdl hdl_;
     std::atomic<bool> open_{false};

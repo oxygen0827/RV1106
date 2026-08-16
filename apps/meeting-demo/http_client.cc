@@ -66,10 +66,13 @@ static bool do_plain(const UrlParts& p, const std::string& request, int timeout_
         std::string h;
         while (std::getline(is, h) && h != "\r" && !h.empty()) headers += h + "\n";
         (void)headers;
-        // 读到 EOF（服务器对 Connection: close 会关闭）
+        // 读到 EOF（服务器对 Connection: close 会关闭）；EINTR 重试
         std::ostringstream body;
-        asio::read(sock, buf, ec);
-        if (ec && ec != asio::error::eof) {
+        do {
+            ec.clear();
+            asio::read(sock, buf, ec);
+        } while (ec == asio::error::interrupted);
+        if (ec && ec != asio::error::eof && ec != asio::error::operation_aborted) {
             LOGF("http read body: %s", ec.message().c_str());
             return false;
         }
@@ -124,8 +127,11 @@ static bool do_tls(const UrlParts& p, const std::string& request, const std::str
         if (sscanf(line.c_str(), "HTTP/%*d.%*d %d", &out.status) != 1) return false;
         while (std::getline(is, h) && h != "\r" && !h.empty()) {}
         std::ostringstream body;
-        asio::read(sock, buf, ec);
-        if (ec && ec != asio::error::eof) {
+        do {
+            ec.clear();
+            asio::read(sock, buf, ec);
+        } while (ec == asio::error::interrupted);
+        if (ec && ec != asio::error::eof && ec != asio::error::operation_aborted) {
             LOGF("https read body: %s", ec.message().c_str());
             return false;
         }

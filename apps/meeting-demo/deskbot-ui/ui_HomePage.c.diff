@@ -1,0 +1,44 @@
+--- a/gui_app/pages/ui_HomePage/ui_HomePage.c
++++ b/gui_app/pages/ui_HomePage/ui_HomePage.c
+@@ -538,19 +538,27 @@
+ 
+ 
+-    // memo app
+-    lv_obj_t * ui_MemoBtn = lv_button_create(ui_AppIconContainer);
+-    lv_obj_set_width(ui_MemoBtn, 70);
+-    lv_obj_set_height(ui_MemoBtn, 70);
+-    lv_obj_set_x(ui_MemoBtn, 15);
+-    lv_obj_set_y(ui_MemoBtn, 55);
+-    lv_obj_set_align(ui_MemoBtn, LV_ALIGN_LEFT_MID);
+-    lv_obj_add_flag(ui_MemoBtn, LV_OBJ_FLAG_SCROLL_ON_FOCUS);     /// Flags
+-    lv_obj_remove_flag(ui_MemoBtn, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
+-    lv_obj_set_style_radius(ui_MemoBtn, 15, LV_PART_MAIN | LV_STATE_DEFAULT);
+-    lv_obj_set_style_bg_color(ui_MemoBtn, lv_color_hex(0xB83B5E), LV_PART_MAIN | LV_STATE_DEFAULT);
+-    lv_obj_set_style_bg_opa(ui_MemoBtn, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+-    lv_obj_set_style_bg_image_src(ui_MemoBtn, &ui_img_memo64_png, LV_PART_MAIN | LV_STATE_DEFAULT);
++    // meeting demo app (会议纪要助手)
++    lv_obj_t * ui_MeetingBtn = lv_button_create(ui_AppIconContainer);
++    lv_obj_set_width(ui_MeetingBtn, 70);
++    lv_obj_set_height(ui_MeetingBtn, 70);
++    lv_obj_set_x(ui_MeetingBtn, 15);
++    lv_obj_set_y(ui_MeetingBtn, 55);
++    lv_obj_set_align(ui_MeetingBtn, LV_ALIGN_LEFT_MID);
++    lv_obj_add_flag(ui_MeetingBtn, LV_OBJ_FLAG_SCROLL_ON_FOCUS);     /// Flags
++    lv_obj_remove_flag(ui_MeetingBtn, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
++    lv_obj_set_style_radius(ui_MeetingBtn, 15, LV_PART_MAIN | LV_STATE_DEFAULT);
++    lv_obj_set_style_bg_color(ui_MeetingBtn, lv_color_hex(0x2E7D5B), LV_PART_MAIN | LV_STATE_DEFAULT);
++    lv_obj_set_style_bg_opa(ui_MeetingBtn, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
++
++    lv_obj_t * ui_MeetingIcon = lv_label_create(ui_MeetingBtn);
++    lv_obj_set_width(ui_MeetingIcon, LV_SIZE_CONTENT);
++    lv_obj_set_height(ui_MeetingIcon, LV_SIZE_CONTENT);
++    lv_obj_set_align(ui_MeetingIcon, LV_ALIGN_CENTER);
++    lv_label_set_text(ui_MeetingIcon, "会议");
++    lv_obj_set_style_text_color(ui_MeetingIcon, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
++    lv_obj_set_style_text_opa(ui_MeetingIcon, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
++    lv_obj_set_style_text_font(ui_MeetingIcon, &ui_font_meeting22, LV_PART_MAIN | LV_STATE_DEFAULT);
+     // event
+-    lv_obj_add_event_cb(ui_MemoBtn, ui_event_AppsBtn, LV_EVENT_CLICKED, "MemoPage");
++    lv_obj_add_event_cb(ui_MeetingBtn, ui_event_AppsBtn, LV_EVENT_CLICKED, "MeetingDemoPage");
+ 
+ 
