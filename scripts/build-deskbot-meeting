@@ -9,7 +9,7 @@
 #      - ui.h 字体声明（sed 注入，GNU patch 对该文件匹配异常，不用 patch）
 #      - ui_HomePage.c 会议图标（未打过整块 patch；打过则 sed 换字体名）
 #   3. 重新 cmake 配置（GLOB 拾取新文件）+ 交叉编译
-#   4. 导出 bin/ 为 tar.gz（排除 system_para.conf，避免覆盖板端令牌/配置）
+#   4. 导出 bin/ 为 tar.gz（排除 system_para.conf，避免覆盖板端现有配置）
 #
 # 产物：out/deskbot-meeting/deskbot-meeting-bin.tar.gz
 set -euo pipefail

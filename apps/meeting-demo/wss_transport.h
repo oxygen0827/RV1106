@@ -11,9 +11,12 @@
 #include <websocketpp/config/asio_no_tls_client.hpp>  // asio_client（ws://）
 
 #include <atomic>
+#include <chrono>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 // 传输层统一接口（与具体 WebSocket 配置解耦）
 struct IWsTransport {
@@ -23,6 +26,8 @@ struct IWsTransport {
     virtual bool send_json(const Json::Value& v) = 0;
     // 二进制帧（API_DOC v2：转写通道推荐直接发裸 PCM bytes）
     virtual bool send_binary(const uint8_t* data, size_t len) = 0;
+    // 等待应用队列和 websocketpp 写缓冲排空，保证控制帧排在全部 PCM 之后。
+    virtual bool flush(int timeout_ms) = 0;
     virtual bool is_open() const = 0;
     virtual void close() = 0;
     virtual void stop() = 0;
@@ -93,6 +98,7 @@ public:
 
     bool connect(const std::string& url, const std::string& cafile) override {
         TlsSetup<ConfigT>::setup(client_, cafile);  // TLS 配置必须先于 get_connection
+        remote_close_code_.store(0);
 
         websocketpp::lib::error_code ec;
         auto conn = client_.get_connection(url, ec);
@@ -134,8 +140,9 @@ public:
         conn->set_close_handler([this](Hdl hdl) {
             (void)hdl;
             auto c = client_.get_con_from_hdl(hdl);
-            int code = c ? c->get_local_close_code() : 0;
-            std::string reason = c ? c->get_local_close_reason() : "";
+            int code = c ? c->get_remote_close_code() : 0;
+            std::string reason = c ? c->get_remote_close_reason() : "";
+            remote_close_code_.store(code);
             open_.store(false);
             LOGF("ws closed code=%d reason=%s", code, reason.c_str());
             if (on_close) on_close(code, reason);
@@ -146,6 +153,10 @@ public:
     }
 
     bool send_json(const Json::Value& v) override {
+        if (!open_.load()) {
+            send_failed_.store(true);
+            return false;
+        }
         Json::StreamWriterBuilder w;
         w["indentation"] = "";
         {
@@ -158,6 +169,10 @@ public:
     }
 
     bool send_binary(const uint8_t* data, size_t len) override {
+        if (!open_.load()) {
+            send_failed_.store(true);
+            return false;
+        }
         {
             std::lock_guard<std::mutex> lk(q_mutex_);
             out_queue_.push_back({false, std::string(reinterpret_cast<const char*>(data), len)});
@@ -166,21 +181,60 @@ public:
         return true;
     }
 
+    bool flush(int timeout_ms) override {
+        client_.get_io_service().post([this]() { flush_out_queue(); });
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(timeout_ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            bool queue_empty;
+            {
+                std::lock_guard<std::mutex> lk(q_mutex_);
+                queue_empty = out_queue_.empty();
+            }
+            if (queue_empty && !flushing_.load() && !open_.load()) {
+                // A normal peer close after our end frame proves that all earlier
+                // WebSocket frames arrived in order, even if buffered_amount no
+                // longer reaches zero after the close handshake starts.
+                return remote_close_code_.load() == websocketpp::close::status::normal &&
+                       !send_failed_.load();
+            }
+            size_t buffered = 0;
+            try {
+                auto conn = client_.get_con_from_hdl(hdl_);
+                if (conn) buffered = conn->get_buffered_amount();
+            } catch (...) {
+                return false;
+            }
+            if (queue_empty && !flushing_.load() && buffered == 0)
+                return !send_failed_.load();
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return false;
+    }
+
     void flush_out_queue() {
+        flushing_.store(true);
         std::vector<OutFrame> batch;
         {
             std::lock_guard<std::mutex> lk(q_mutex_);
             batch.swap(out_queue_);
         }
         for (const OutFrame& f : batch) {
-            if (!open_.load()) continue;  // 未连接/已关闭时静默丢弃
+            if (!open_.load()) {
+                send_failed_.store(true);
+                continue;
+            }
             websocketpp::lib::error_code ec;
             client_.send(hdl_, f.data,
                          f.text ? websocketpp::frame::opcode::text
                                 : websocketpp::frame::opcode::binary,
                          ec);
-            if (ec) LOGF("ws send: %s", ec.message().c_str());
+            if (ec) {
+                send_failed_.store(true);
+                LOGF("ws send: %s", ec.message().c_str());
+            }
         }
+        flushing_.store(false);
     }
 
     bool is_open() const override { return open_.load(); }
@@ -221,6 +275,9 @@ private:
     Hdl hdl_;
     std::atomic<bool> open_{false};
     std::atomic<bool> running_{false};
+    std::atomic<bool> flushing_{false};
+    std::atomic<int> remote_close_code_{0};
+    std::atomic<bool> send_failed_{false};
 };
 
 // 工厂：按 URL scheme 选择明文/TLS 实现

@@ -3,7 +3,10 @@
 
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
 
+#include <cstdint>
 #include <cstring>
 #include <sys/time.h>
 
@@ -11,6 +14,10 @@
 #include <sstream>
 
 namespace asio = boost::asio;
+namespace beast = boost::beast;
+namespace http = beast::http;
+
+static const std::uint64_t kMaxResponseBytes = 8u * 1024u * 1024u;
 
 struct UrlParts {
     bool tls = false;
@@ -38,6 +45,25 @@ static bool parse_url(const std::string& url, UrlParts& p) {
     return !p.host.empty();
 }
 
+template <typename Stream>
+static bool read_response(Stream& stream, const char* protocol, HttpResponse& out) {
+    beast::flat_buffer buffer;
+    http::response_parser<http::string_body> parser;
+    parser.body_limit(kMaxResponseBytes);
+
+    boost::system::error_code ec;
+    http::read(stream, buffer, parser, ec);
+    if (ec) {
+        LOGF("%s read response: %s", protocol, ec.message().c_str());
+        return false;
+    }
+
+    const http::response<http::string_body>& response = parser.get();
+    out.status = response.result_int();
+    out.body = response.body();
+    return true;
+}
+
 static bool do_plain(const UrlParts& p, const std::string& request, int timeout_sec,
                      HttpResponse& out) {
     try {
@@ -52,33 +78,7 @@ static bool do_plain(const UrlParts& p, const std::string& request, int timeout_
         setsockopt(sock.native_handle(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
         asio::write(sock, asio::buffer(request));
-        asio::streambuf buf;
-        boost::system::error_code ec;
-        asio::read_until(sock, buf, "\r\n\r\n", ec);
-        if (ec && ec != asio::error::eof) {
-            LOGF("http read header: %s", ec.message().c_str());
-            return false;
-        }
-        std::istream is(&buf);
-        std::string line, headers;
-        std::getline(is, line);  // status line
-        if (sscanf(line.c_str(), "HTTP/%*d.%*d %d", &out.status) != 1) return false;
-        std::string h;
-        while (std::getline(is, h) && h != "\r" && !h.empty()) headers += h + "\n";
-        (void)headers;
-        // 读到 EOF（服务器对 Connection: close 会关闭）；EINTR 重试
-        std::ostringstream body;
-        do {
-            ec.clear();
-            asio::read(sock, buf, ec);
-        } while (ec == asio::error::interrupted);
-        if (ec && ec != asio::error::eof && ec != asio::error::operation_aborted) {
-            LOGF("http read body: %s", ec.message().c_str());
-            return false;
-        }
-        body << &buf;
-        out.body = body.str();
-        return true;
+        return read_response(sock, "http", out);
     } catch (const std::exception& e) {
         LOGF("http error: %s", e.what());
         return false;
@@ -114,30 +114,7 @@ static bool do_tls(const UrlParts& p, const std::string& request, const std::str
         sock.handshake(asio::ssl::stream_base::client);
 
         asio::write(sock, asio::buffer(request));
-        asio::streambuf buf;
-        boost::system::error_code ec;
-        asio::read_until(sock, buf, "\r\n\r\n", ec);
-        if (ec && ec != asio::error::eof) {
-            LOGF("https read header: %s", ec.message().c_str());
-            return false;
-        }
-        std::istream is(&buf);
-        std::string line, h;
-        std::getline(is, line);
-        if (sscanf(line.c_str(), "HTTP/%*d.%*d %d", &out.status) != 1) return false;
-        while (std::getline(is, h) && h != "\r" && !h.empty()) {}
-        std::ostringstream body;
-        do {
-            ec.clear();
-            asio::read(sock, buf, ec);
-        } while (ec == asio::error::interrupted);
-        if (ec && ec != asio::error::eof && ec != asio::error::operation_aborted) {
-            LOGF("https read body: %s", ec.message().c_str());
-            return false;
-        }
-        body << &buf;
-        out.body = body.str();
-        return true;
+        return read_response(sock, "https", out);
     } catch (const std::exception& e) {
         LOGF("https error: %s", e.what());
         return false;

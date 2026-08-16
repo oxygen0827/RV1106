@@ -2,7 +2,7 @@
 # 部署带「会议纪要」入口的 DeskBot 到板端并重启
 #
 # 流程：校验 ADB → 备份旧 main → 停 DeskBot → 解包新 bin（不含
-# system_para.conf，板端令牌/网络配置不被覆盖）→ 校验配置未变 →
+# system_para.conf，板端现有配置不被覆盖）→ 校验配置未变 →
 # 确保 meeting_demo 与 server.conf 就绪 → 重启 DeskBot → 验收。
 set -euo pipefail
 
@@ -16,6 +16,10 @@ if ! adb devices | grep -qw device; then
   exit 1
 fi
 test -f "${TARBALL}" || { echo "error: 缺少 ${TARBALL}，先运行 scripts/build-deskbot-meeting" >&2; exit 1; }
+
+CONFIG_SHA_BEFORE=$(adb shell \
+  'test -f /root/bin/system_para.conf && sha256sum /root/bin/system_para.conf | cut -d" " -f1 || echo missing' \
+  | tr -d '\r')
 
 # 1. 备份当前 main 到宿主机（板端 rootfs 仅剩 ~2MB，不在板上 cp）
 BACKUP_DIR="${PROJECT_DIR}/out/deskbot-meeting/rollback"
@@ -43,13 +47,19 @@ else
   echo "warning: main sha mismatch new=${NEW_SHA} board=${BOARD_SHA}" >&2
 fi
 
-# 4. 配置完整性校验（system_para.conf 是 key=value 行；不打印令牌内容）
-adb shell 'TOKEN=$(sed -n "s/^AIChat_server_token=//p" /root/bin/system_para.conf | head -1); echo "AIChat token len=${#TOKEN}"'
-adb shell 'echo "config size: $(wc -c < /root/bin/system_para.conf) bytes"'
+# 4. 配置完整性校验；会议纪要不读取或要求 AIChat/GLM 凭据。
+CONFIG_SHA_AFTER=$(adb shell \
+  'test -f /root/bin/system_para.conf && sha256sum /root/bin/system_para.conf | cut -d" " -f1 || echo missing' \
+  | tr -d '\r')
+if [[ "${CONFIG_SHA_BEFORE}" != "${CONFIG_SHA_AFTER}" ]]; then
+  echo "error: system_para.conf changed during deployment" >&2
+  exit 1
+fi
+echo "system_para.conf unchanged"
 
 # 5. 确保 meeting_demo 与服务器配置就绪
 adb shell 'mkdir -p /root/meeting_demo; \
-  test -f /root/meeting_demo/server.conf || echo ws://192.168.31.97:8700 > /root/meeting_demo/server.conf; \
+  test -f /root/meeting_demo/server.conf || echo wss://clare.vinex.top/voice-api > /root/meeting_demo/server.conf; \
   test -x /root/meeting_demo/meeting_demo || echo "warning: /root/meeting_demo/meeting_demo 不存在（先跑 scripts/deploy-meeting-demo）"'
 adb shell 'echo "server.conf: $(cat /root/meeting_demo/server.conf)"'
 

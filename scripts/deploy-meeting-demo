@@ -2,14 +2,14 @@
 # 部署并运行 meeting_demo（会议纪要助手板端 demo）
 #
 # 流程：构建（可选）→ 推送 /root/meeting_demo → 板端调教音频参数 → 前台运行
-# 前台运行保留 stdin，可在终端里按 Enter 提问 / s 打断 / q 退出（Ctrl+C 亦可）。
+# 默认只运行会议纪要链路；前台按 q 或 Ctrl+C 结束会议并生成纪要。
 #
 # 用法:
 #   scripts/deploy-meeting-demo [--no-build] [--server ws://HOST:PORT]
 #                               [--mode listen|host|full] [--auto-host-every N]
 #                               [--local-mock]
 #
-# --local-mock：把纯 stdlib mock 后端和 MP3 资产一并部署到板端并在板端
+# --local-mock：把纯 stdlib mock 后端一并部署到板端并在板端
 #   常驻启动，demo 用 ws://127.0.0.1:8700 回环连接，不依赖 Wi-Fi/外网。
 set -euo pipefail
 
@@ -20,8 +20,8 @@ PACKAGE_DIR="${PROJECT_DIR}/out/meeting-demo"
 RUNNER_SRC="${PROJECT_DIR}/scripts/board/meeting-demo-run.sh"
 REMOTE_DIR=/root/meeting_demo
 REMOTE_MOCK=/root/mock-server
-SERVER="ws://192.168.31.97:8700"
-MODE=full
+SERVER="wss://clare.vinex.top/voice-api"
+MODE=listen
 EXTRA_ARGS=""
 build=1
 local_mock=0
@@ -32,8 +32,9 @@ Usage: scripts/deploy-meeting-demo [--no-build] [--server ws://HOST:PORT]
                                   [--mode listen|host|full] [--auto-host-every N]
                                   [--local-mock]
 
-Builds, deploys, and runs the meeting demo. Runs in the foreground so console
-keys work: Enter = ask / end asking, s = interrupt, q = quit.
+Builds, deploys, and runs the meeting-minutes demo in listen mode by default.
+Press q or Ctrl+C to end the meeting and generate the final minutes.
+Host/full modes remain available only for explicit compatibility testing.
 --local-mock deploys the stdlib mock backend onto the board (loopback).
 USAGE_EOF
 }
@@ -78,8 +79,16 @@ if [[ "$local_mock" -eq 1 ]]; then
   adb push "${MOCK_SRC}/mock_server_stdlib.py" "${REMOTE_MOCK}/" >/dev/null
   adb push "${MOCK_SRC}/assets/s1.mp3" "${MOCK_SRC}/assets/s2.mp3" \
            "${MOCK_SRC}/assets/s3.mp3" "${REMOTE_MOCK}/assets/" >/dev/null
-  adb shell "killall mock_server_stdlib.py 2>/dev/null || true; sleep 1; \
-    cd ${REMOTE_MOCK} && start-stop-daemon -S -b -x /usr/bin/python3 -- \
+  adb shell "if [ -f /tmp/meeting-mock.pid ]; then \
+      old_pid=\$(cat /tmp/meeting-mock.pid); kill \"\$old_pid\" 2>/dev/null || true; \
+      rm -f /tmp/meeting-mock.pid; \
+    fi; \
+    for pid in \$(ps | awk '\$3 == "/usr/bin/python3" && \
+                               \$4 == "mock_server_stdlib.py" {print \$1}'); do \
+      kill \"\$pid\" 2>/dev/null || true; \
+    done; \
+    sleep 1; cd ${REMOTE_MOCK} && \
+    start-stop-daemon -S -b -m -p /tmp/meeting-mock.pid -x /usr/bin/python3 -- \
     mock_server_stdlib.py --port 8700 --assets ${REMOTE_MOCK}/assets" >/dev/null
   sleep 2
   if ! adb shell "wget -q -T 3 -O - http://127.0.0.1:8700/health" | grep -q '"ok"'; then
@@ -91,7 +100,11 @@ fi
 
 # 板端运行（前台，保留交互）
 echo "running meeting_demo: server=${SERVER} mode=${MODE}"
-echo "（Enter=提问/结束提问  s=打断  q/Ctrl+C=退出）"
+if [[ "${MODE}" == "listen" ]]; then
+  echo "（q/Ctrl+C=结束会议并生成纪要）"
+else
+  echo "（Enter=提问/结束提问  s=打断  q/Ctrl+C=结束）"
+fi
 set +e
 adb shell "APP=${REMOTE_DIR} SERVER=${SERVER} MODE=${MODE} EXTRA_ARGS=\"${EXTRA_ARGS}\" ${REMOTE_DIR}/meeting-demo-run.sh" 2>&1 \
   | tr -d '\r' | tee "${PROJECT_DIR}/out/meeting-demo-run.log"

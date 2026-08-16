@@ -1,8 +1,8 @@
 /*
  * deskbot-launcher-smoke —— 复刻 ui_MeetingDemoPage 的进程管道链路做板端冒烟：
  *   fork/exec meeting-demo-run.sh（stdin 与合并后的 stdout/stderr 走管道）
- *   → 校验 Session、transcribe WS、partial/final 转写与 /end
- *   → 写入 q，校验子进程优雅退出 rc=0 且无孤儿。
+ *   → 校验 Session、transcribe WS、partial/final 转写、最终理解与本地纪要
+ *   → 写入 q，校验子进程优雅结束 rc=0 且无孤儿。
  * 不依赖 LVGL/DeskBot，可在板端单独验证「图标页面的启动逻辑」。
  * 用法: deskbot-launcher-smoke [SERVER]   (默认 ws://127.0.0.1:8700)
  */
@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,23 +21,35 @@ static int g_stdin_fd = -1;
 static int g_stdout_fd = -1;
 static pid_t g_pid = -1;
 static pthread_t g_thread;
-static int g_exit_rc = -999;
-static volatile int g_child_done;
-static volatile int g_session_created;
-static volatile int g_transcribe_open;
-static volatile int g_ready;
-static volatile int g_partial_seen;
-static volatile int g_final_seen;
-static volatile int g_session_ended;
+static atomic_int g_exit_rc = -999;
+static atomic_int g_child_done;
+static atomic_int g_session_created;
+static atomic_int g_transcribe_open;
+static atomic_int g_ready;
+static atomic_int g_partial_count;
+static atomic_int g_final_count;
+static atomic_int g_session_ended;
+static atomic_int g_minutes_complete;
+static atomic_int g_record_saved;
+static atomic_int g_goal_seen;
+static atomic_int g_topic_seen;
+static atomic_int g_consensus_seen;
+static atomic_int g_todo_seen;
 
 static void observe_child_line(const char *line)
 {
-    if (strstr(line, "session created:") != NULL) g_session_created = 1;
-    if (strstr(line, "[transcribe] open") != NULL) g_transcribe_open = 1;
-    if (strstr(line, "ready. ") != NULL) g_ready = 1;
-    if (strstr(line, "[转写-中间]") != NULL) g_partial_seen = 1;
-    if (strstr(line, "[转写]") != NULL) g_final_seen = 1;
-    if (strstr(line, " ended: status=200") != NULL) g_session_ended = 1;
+    if (strstr(line, "session created:") != NULL) atomic_store(&g_session_created, 1);
+    if (strstr(line, "[transcribe] open") != NULL) atomic_store(&g_transcribe_open, 1);
+    if (strstr(line, "ready. ") != NULL) atomic_store(&g_ready, 1);
+    if (strstr(line, "[转写-中间]") != NULL) atomic_fetch_add(&g_partial_count, 1);
+    if (strstr(line, "[转写]") != NULL) atomic_fetch_add(&g_final_count, 1);
+    if (strstr(line, " ended: status=200") != NULL) atomic_store(&g_session_ended, 1);
+    if (strstr(line, "[纪要完成]") != NULL) atomic_store(&g_minutes_complete, 1);
+    if (strstr(line, "[纪要已保存]") != NULL) atomic_store(&g_record_saved, 1);
+    if (strstr(line, "[目标]") != NULL) atomic_store(&g_goal_seen, 1);
+    if (strstr(line, "[议题1]") != NULL) atomic_store(&g_topic_seen, 1);
+    if (strstr(line, "[结论]") != NULL) atomic_store(&g_consensus_seen, 1);
+    if (strstr(line, "[待办]") != NULL) atomic_store(&g_todo_seen, 1);
 }
 
 static void *reader_thread(void *arg)
@@ -77,10 +90,10 @@ static void *reader_thread(void *arg)
     }
     int st = 0;
     if (waitpid(g_pid, &st, 0) == g_pid) {
-        g_exit_rc = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
-        printf("[smoke] child exited rc=%d\n", g_exit_rc);
+        atomic_store(&g_exit_rc, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+        printf("[smoke] child exited rc=%d\n", atomic_load(&g_exit_rc));
     }
-    g_child_done = 1;
+    atomic_store(&g_child_done, 1);
     return NULL;
 }
 
@@ -99,7 +112,8 @@ static int start_child(const char *server)
         dup2(out_pipe[1], STDERR_FILENO);
         char sh_cmd[512];
         snprintf(sh_cmd, sizeof(sh_cmd),
-                 "APP=/root/meeting_demo MODE=listen SERVER=%s EXTRA_ARGS='--vad 0' "
+                 "APP=/root/meeting_demo MODE=listen SERVER=%s "
+                 "EXTRA_ARGS='--vad 0 --record /tmp/meeting-smoke-latest.json' "
                  "exec /root/meeting_demo/meeting-demo-run.sh", server);
         execl("/bin/sh", "sh", "-c", sh_cmd, (char *)NULL);
         _exit(127);
@@ -137,22 +151,70 @@ static void wait_child_dead(int timeout_s)
     pthread_join(g_thread, NULL);
 }
 
+static int record_is_complete(void)
+{
+    FILE *fp = fopen("/tmp/meeting-smoke-latest.json", "rb");
+    if (!fp) return 0;
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return 0; }
+    long size = ftell(fp);
+    if (size <= 0 || size > 1024 * 1024 || fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        return 0;
+    }
+    char *buf = malloc((size_t)size + 1);
+    if (!buf) { fclose(fp); return 0; }
+    size_t n = fread(buf, 1, (size_t)size, fp);
+    fclose(fp);
+    buf[n] = '\0';
+    int complete = n == (size_t)size &&
+                   strstr(buf, "\"transcript\"") != NULL &&
+                   strstr(buf, "\"understanding\"") != NULL &&
+                   strstr(buf, "\"analysis_final\" : true") != NULL &&
+                   strstr(buf, "\"sourceComplete\" : true") != NULL &&
+                   strstr(buf, "\"analysisComplete\" : true") != NULL &&
+                   strstr(buf, "\"state\" : \"final\"") != NULL &&
+                   strstr(buf, "\"transcript_count\" : 2") != NULL &&
+                   strstr(buf, "\"lastSuccessfulCursor\" : 2") != NULL &&
+                   strstr(buf, "\"pendingTranscriptCount\" : 0") != NULL &&
+                   strstr(buf, "\"dropped_frames\" : 0") != NULL &&
+                   strstr(buf, "同比增长了百分之二十三") != NULL &&
+                   strstr(buf, "复盘第三季度增长并明确后续动作") != NULL &&
+                   strstr(buf, "第三季度增长") != NULL &&
+                   strstr(buf, "整理海外市场增长明细") != NULL;
+    free(buf);
+    return complete;
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
+    unlink("/tmp/meeting-smoke-latest.json");
     const char *server = (argc > 1) ? argv[1] : "ws://127.0.0.1:8700";
     printf("[smoke] server=%s\n", server);
     if (start_child(server) != 0) { perror("start_child"); return 1; }
     printf("[smoke] child pid=%d\n", (int)g_pid);
 
-    // 本地 mock 在收到 6/10 帧二进制 PCM 后返回 partial/final。
-    // --vad 0 使该检查不受环境音量影响；VAD 另做独立回归。
-    for (int i = 0; i < 200 && !g_child_done && !g_final_seen; i++) usleep(100000);
-    printf("[smoke] core session=%d ws=%d ready=%d partial=%d final=%d\n",
-           g_session_created, g_transcribe_open, g_ready, g_partial_seen, g_final_seen);
-    printf("[smoke] q (退出)\n");      send_key("q\n");
+    // 等到第一句 final、第二句仍为 partial 时立即结束，验证 end 会把尾句
+    // 补成 final 并纳入最终理解；--vad 0 使检查不受环境音量影响。
+    int tail_barrier = 0;
+    for (int i = 0; i < 200 && !atomic_load(&g_child_done); i++) {
+        int finals = atomic_load(&g_final_count);
+        if (finals == 1 && atomic_load(&g_partial_count) >= 2) {
+            tail_barrier = 1;
+            break;
+        }
+        // If the second ordinary final already arrived, this run did not test
+        // end-triggered tail finalization and must fail instead of false-passing.
+        if (finals >= 2) break;
+        usleep(100000);
+    }
+    printf("[smoke] core session=%d ws=%d ready=%d partial=%d final=%d tail_barrier=%d\n",
+           atomic_load(&g_session_created), atomic_load(&g_transcribe_open),
+           atomic_load(&g_ready), atomic_load(&g_partial_count),
+           atomic_load(&g_final_count), tail_barrier);
+    printf("[smoke] q (结束会议)\n");  send_key("q\n");
 
-    wait_child_dead(12);
+    wait_child_dead(65);
     if (g_stdin_fd >= 0) close(g_stdin_fd);
     g_stdin_fd = -1;
 
@@ -163,11 +225,24 @@ int main(int argc, char **argv)
     char buf[64] = {0};
     if (fp) { fread(buf, 1, sizeof(buf) - 1, fp); pclose(fp); }
     int orphan = (buf[0] != '\0');
-    int core_ok = g_session_created && g_transcribe_open && g_ready &&
-                  g_partial_seen && g_final_seen && g_session_ended;
-    int pass = core_ok && g_exit_rc == 0 && group_gone && !orphan;
-    printf("[smoke] end=%d group_gone=%d orphan=%d child_rc=%d\n",
-           g_session_ended, group_gone, orphan, g_exit_rc);
+    int record_ok = record_is_complete();
+    int core_ok = tail_barrier && atomic_load(&g_session_created) &&
+                  atomic_load(&g_transcribe_open) &&
+                  atomic_load(&g_ready) && atomic_load(&g_partial_count) >= 2 &&
+                  atomic_load(&g_final_count) >= 2 && atomic_load(&g_session_ended) &&
+                  atomic_load(&g_minutes_complete) && atomic_load(&g_record_saved) && record_ok;
+    core_ok = core_ok && atomic_load(&g_goal_seen) && atomic_load(&g_topic_seen) &&
+              atomic_load(&g_consensus_seen) && atomic_load(&g_todo_seen);
+    int exit_rc = atomic_load(&g_exit_rc);
+    int pass = core_ok && exit_rc == 0 && group_gone && !orphan;
+    printf("[smoke] end=%d minutes=%d saved=%d record=%d fields=%d/%d/%d/%d "
+           "partial=%d final=%d "
+           "group_gone=%d orphan=%d child_rc=%d\n",
+           atomic_load(&g_session_ended), atomic_load(&g_minutes_complete),
+           atomic_load(&g_record_saved), record_ok, atomic_load(&g_goal_seen),
+           atomic_load(&g_topic_seen), atomic_load(&g_consensus_seen),
+           atomic_load(&g_todo_seen), atomic_load(&g_partial_count),
+           atomic_load(&g_final_count), group_gone, orphan, exit_rc);
     printf("[smoke] result: %s\n",
            pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;

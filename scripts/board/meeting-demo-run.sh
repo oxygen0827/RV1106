@@ -1,11 +1,11 @@
 #!/bin/sh
 # 板端运行 meeting_demo（前置：麦克风/喇叭参数调教 + 前台运行）
-# 环境: APP=/root/meeting_demo, SERVER=ws://..., MODE=full, CAFILE=/root/bin/cacert.pem
+# 环境: APP=/root/meeting_demo, SERVER=wss://..., MODE=listen, CAFILE=/root/bin/cacert.pem
 set -u
 
 APP=${APP:-/root/meeting_demo}
-SERVER=${SERVER:-ws://192.168.31.97:8700}
-MODE=${MODE:-full}
+SERVER=${SERVER:-wss://clare.vinex.top/voice-api}
+MODE=${MODE:-listen}
 CAFILE=${CAFILE:-/root/bin/cacert.pem}
 EXTRA_ARGS=${EXTRA_ARGS:-}
 

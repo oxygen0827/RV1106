@@ -5,10 +5,14 @@
 ```
 ALSA 采集 16kHz/mono/s16（100ms 帧）
   → 二进制 PCM → /ws/transcribe 持续推流
-  → Base64 + JSON → /ws/host 问答
-  ← transcription / answer_text（流式）/ answer_audio（24kHz MP3 逐句）
-  → minimp3 软解 → 播放队列 → ALSA 24kHz 边收边播
+  ← partial 原位更新 / final 固定追加
+  → /api/session/{id}/understanding 周期读取会议理解
+  → 结束会议 → /end → 最终转写 + 最终理解
+  → /root/meeting_demo/latest-meeting.json 原子保存
 ```
+
+设备端不需要 LLM、GLM 或 AIChat 凭据。结构化纪要由已配置模型凭据的
+clare-voice-api 在云端生成；`/ws/host` 问答是独立兼容能力，不进入本 Demo。
 
 ## 架构要点：传输层抽象
 
@@ -22,19 +26,20 @@ ALSA 采集 16kHz/mono/s16（100ms 帧）
 ```sh
 ./scripts/build-meeting-demo          # Docker SDK 容器内交叉编译 → out/meeting-demo/
 ./scripts/deploy-meeting-demo --local-mock     # 部署 + 板端本地 mock + 运行
-./scripts/deploy-meeting-demo --server ws://192.168.31.97:8700 --mode full
+./scripts/deploy-meeting-demo         # 默认连生产 Voice API，listen 模式
 ```
 
-部署脚本会同时更新 `meeting_demo` 与 `meeting-demo-run.sh`；`full` 模式会等
-transcribe/host 两条 WS 都打开，再预热 ASR 2 秒并启动采集。弱网预热只发送
-一帧静音，避免连续静音 PCM 排在真实语音前面。
+部署脚本会同时更新 `meeting_demo` 与 `meeting-demo-run.sh`；`listen` 模式会等
+transcribe WS 打开，再预热 ASR 2 秒并启动采集。弱网预热只发送一帧静音，
+避免连续静音 PCM 排在真实语音前面。
 
-控制台：`Enter`=按住提问/再按结束提问  `s`=打断  `q`=退出（优雅收尾）
-无人值守：`--auto-host-every N` 每 N 秒自动提问一轮。
+控制台：`q` 或 `Ctrl+C` = 结束会议、排空尾句并生成最终纪要。
 
 参数：`--server ws(s)://HOST:PORT`、`--mode listen|host|full`、
 `--cafile PATH`（wss 校验，默认 /root/bin/cacert.pem）、
 `--duplex-upload 0|1`（默认 0：播放回答期间暂停转写上行，半双工时序防回声）。
+`--record FILE` 指定最终会议记录；默认保存到
+`/root/meeting_demo/latest-meeting.json`，内容包含完整转写、最终理解和结束状态。
 
 ## 屏幕入口（DeskBot 桌面图标）
 
@@ -51,15 +56,16 @@ meeting_demo 本身是控制台程序，不出画面。桌面上给它加图标/
 - 页面初始状态为「未开始」，显示全宽绿色「开启会议」按钮；
   点击后 fork/exec `/root/meeting_demo/meeting-demo-run.sh`（基础 Demo 默认 listen 模式），
   板端开始录音并推流，partial/final 转写经子进程 stdout 管道实时显示在
-  转写文本区（按钮自动隐藏，状态变「运行中」）。
-- 基础 Demo 仅保留 `开启会议` 和 `退出`；Host 提问/打断控件暂时隐藏。
-  会议进程自行退出后状态变「已停止」，
-  「开启会议」按钮重新出现，可再次开启新会议。
+  转写文本区；partial 原位替换，final 才固定追加。
+- 运行后按钮切换为红色「结束会议」。点击后页面保持打开并显示「生成纪要中」，
+  等待服务端最终化，再展示概要、目标、议题、结论和待办。完成后按钮恢复为
+  「开启会议」，可再次开启新会议；左上角返回键只负责离开页面。
+- Host 问答属于独立能力，不进入会议纪要基础页面，也不依赖 AIChat 或智谱 Key。
 - `deskbot-launcher-smoke` 的 PASS 条件为 Session 创建、transcribe WS 打开、
-  partial/final、`/end=200`、`rc=0` 且无孤儿进程。
+  partial/final、`/end=200`、最终理解、完整本地记录、`rc=0` 且无孤儿进程。
 - 服务器地址优先读 `/root/meeting_demo/server.conf`（一行 ws(s)://URL），
-  缺省 `ws://192.168.31.97:8700`；板端本地 mock 时写成 `ws://127.0.0.1:8700`。
-- 部署包排除 `system_para.conf`：AIChat 令牌等板端配置不被模板覆盖；
+  缺省 `wss://clare.vinex.top/voice-api`；板端本地 mock 时写成 `ws://127.0.0.1:8700`。
+- 部署包排除 `system_para.conf`，板端已有配置不会被模板覆盖；
   旧 main 自动备份到 `out/deskbot-meeting/rollback/`（adb pull）。
 - **字库**：DeskBot 自带 heiti 字库是上游页面裁剪的子集（heiti14 仅 104 个
   汉字），页面文案和转写文本会显示「口」。本应用自带生成字库
@@ -72,10 +78,9 @@ meeting_demo 本身是控制台程序，不出画面。桌面上给它加图标/
 
 ## 板端实机验证（2026-08-16）
 
-- full 模式：转写持续推流 + 自动问答两轮，文本流式显示、MP3 解码播放、
+- listen 模式：转写持续推流，结束时补齐尾句，生成结构化纪要并保存 JSON，
   退出 rc=0、无残留进程。
-- 音频：16kHz 采集（板端 amixer 调教见 dev-experience.md）、24kHz 播放
-  （ACodec 原生支持，免重采样）。
+- 音频：16kHz 采集（板端 amixer 调教见 dev-experience.md）。
 
 ## 踩坑记录（详见 docs/dev-experience.md）
 

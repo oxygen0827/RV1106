@@ -11,7 +11,7 @@
 // 用法：
 //   meeting_demo --server ws://HOST:PORT [--topic 名称] [--mode listen|host|full]
 //                [--cafile /root/bin/cacert.pem] [--duplex-upload 0|1]
-//                [--auto-host-every N]
+//                [--auto-host-every N] [--record FILE]
 //
 // 控制台（host/full 模式）：
 //   Enter  按住提问 / 再按结束提问（send end_of_speech）
@@ -22,16 +22,22 @@
 #include <json/json.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
 #include <sstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <poll.h>
 #include <string>
+#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 #include "audio.h"
 #include "http_client.h"
@@ -44,6 +50,202 @@ static std::atomic<bool> g_answering{false};  // 提问后、done 前的回答�
 
 static void on_signal(int) { g_quit.store(true); }
 
+static bool parse_json_object(const std::string& body, Json::Value& out) {
+    Json::CharReaderBuilder rb;
+    std::string errors;
+    std::istringstream input(body);
+    return Json::parseFromStream(rb, input, &out, &errors) && out.isObject();
+}
+
+static std::string one_line(std::string value) {
+    for (char& c : value) {
+        if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+    }
+    return value;
+}
+
+static bool write_file_atomic(const std::string& path, const std::string& data) {
+    if (path.empty()) return true;
+    std::string tmp = path + ".tmp." + std::to_string((long long)getpid());
+    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return false;
+    (void)::fchmod(fd, 0600);
+    size_t written = 0;
+    while (written < data.size()) {
+        ssize_t n = ::write(fd, data.data() + written, data.size() - written);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            ::close(fd);
+            ::unlink(tmp.c_str());
+            return false;
+        }
+        written += (size_t)n;
+    }
+    bool ok = (::fsync(fd) == 0);
+    if (::close(fd) != 0) ok = false;
+    if (ok && ::rename(tmp.c_str(), path.c_str()) != 0) ok = false;
+    if (!ok) ::unlink(tmp.c_str());
+    return ok;
+}
+
+static void log_final_minutes(const Json::Value& snapshot) {
+    const Json::Value& analysis = snapshot["analysis"];
+    const Json::Value& overview = snapshot["overview"];
+    const Json::Value& understanding = snapshot["understanding"];
+    std::string state = analysis.get("state", "unknown").asString();
+    long long revision = snapshot.get("revision", 0).asInt64();
+    long long transcripts = snapshot.get("transcriptCount", 0).asInt64();
+    LOGF("[纪要完成] state=%s revision=%lld transcripts=%lld",
+         state.c_str(), revision, transcripts);
+
+    std::string headline = one_line(overview.get("headline", "暂无会议概要").asString());
+    LOGF("[概要] %s", headline.c_str());
+    std::string goal = one_line(understanding.get("meetingGoal", "").asString());
+    LOGF("[目标] %s", goal.empty() ? "暂未明确" : goal.c_str());
+
+    const Json::Value& topics = understanding["topics"];
+    if (!topics.isArray() || topics.empty()) {
+        LOGF("[议题] 暂无可归纳内容");
+        LOGF("[结论] 暂无明确结论");
+        LOGF("[待办] 暂无待办");
+        return;
+    }
+    for (Json::ArrayIndex i = 0; i < topics.size(); ++i) {
+        const Json::Value& topic = topics[i];
+        std::string title = one_line(topic.get("title", "未命名议题").asString());
+        LOGF("[议题%u] %s", (unsigned)(i + 1), title.c_str());
+
+        const Json::Value& consensus = topic["consensus"];
+        bool has_consensus = false;
+        if (consensus.isArray()) {
+            for (Json::ArrayIndex j = 0; j < consensus.size(); ++j) {
+                std::string text = one_line(consensus[j].asString());
+                if (!text.empty()) {
+                    has_consensus = true;
+                    LOGF("[结论] %s", text.c_str());
+                }
+            }
+        }
+        if (!has_consensus) LOGF("[结论] 暂无明确结论");
+        const Json::Value& todos = topic["todos"];
+        bool has_todo = false;
+        if (todos.isArray()) {
+            for (Json::ArrayIndex j = 0; j < todos.size(); ++j) {
+                const Json::Value& todo = todos[j];
+                std::string owner = one_line(todo.get("owner", "待认领").asString());
+                std::string action = one_line(todo.get("action", "").asString());
+                std::string deadline = one_line(todo.get("deadline", "").asString());
+                if (action.empty()) continue;
+                has_todo = true;
+                if (deadline.empty()) LOGF("[待办] %s：%s", owner.c_str(), action.c_str());
+                else LOGF("[待办] %s：%s（%s）", owner.c_str(), action.c_str(), deadline.c_str());
+            }
+        }
+        if (!has_todo) LOGF("[待办] 暂无待办");
+    }
+}
+
+static bool transcript_snapshot_complete(const Json::Value& snapshot) {
+    const Json::Value& transcript = snapshot["transcript"];
+    if (!transcript.isArray() || !snapshot["count"].isIntegral() ||
+        snapshot["count"].asUInt64() != transcript.size()) {
+        return false;
+    }
+    for (const Json::Value& item : transcript) {
+        if (!item.isObject() || !item["text"].isString() ||
+            item.get("is_final", false).asBool() == false) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool understanding_snapshot_final(const Json::Value& snapshot) {
+    return snapshot["analysis"].isObject() &&
+           snapshot["analysis"].get("state", "").asString() == "final" &&
+           snapshot["overview"].isObject() && snapshot["understanding"].isObject();
+}
+
+static bool count_equals(const Json::Value& value, Json::UInt64 expected) {
+    return value.isIntegral() && value.asUInt64() == expected;
+}
+
+static bool completion_state_matches(const Json::Value& snapshot, Json::UInt64 count) {
+    auto matches = [count](const Json::Value& state) {
+        return state.isObject() && count_equals(state["transcriptCount"], count) &&
+               count_equals(state["committedTranscriptCount"], count) &&
+               count_equals(state["cursor"], count) &&
+               count_equals(state["pendingTranscriptCount"], 0) &&
+               state.get("sourceComplete", false).asBool() &&
+               state.get("analysisComplete", false).asBool();
+    };
+    return matches(snapshot) && matches(snapshot["transcriptState"]);
+}
+
+static bool audio_backlog_empty(const Json::Value& snapshot) {
+    const Json::Value& backlog = snapshot["audioBacklog"];
+    return backlog.isObject() && count_equals(backlog["queued_ms"], 0) &&
+           count_equals(backlog["dropped_ms"], 0) &&
+           count_equals(backlog["dropped_frames"], 0);
+}
+
+static bool final_snapshots_consistent(const std::string& session_id,
+                                       const Json::Value& end,
+                                       const Json::Value& transcript,
+                                       const Json::Value& understanding,
+                                       std::string& reason) {
+    const Json::UInt64 count = transcript["count"].asUInt64();
+    const Json::Value& analysis = understanding["analysis"];
+    const Json::Value& decision = understanding["decisionState"];
+    auto fail = [&](const char* message) {
+        reason = message;
+        return false;
+    };
+
+    if (end.get("status", "").asString() != "ended")
+        return fail("结束接口状态不是 ended");
+    if (!count_equals(end["transcript_count"], count))
+        return fail("结束接口与最终转写条数不一致");
+    if (transcript.get("session_id", "").asString() != session_id ||
+        understanding.get("sessionId", "").asString() != session_id)
+        return fail("最终快照 Session 不一致");
+    if (understanding.get("status", "").asString() != "ended")
+        return fail("理解快照尚未结束");
+    if (!completion_state_matches(end, count) ||
+        !completion_state_matches(transcript, count) ||
+        !completion_state_matches(understanding, count))
+        return fail("服务端完整性状态未全部确认");
+    if (!count_equals(analysis["lastSuccessfulCursor"], count) ||
+        !count_equals(analysis["pendingTranscriptCount"], 0) ||
+        !decision.isObject() || !count_equals(decision["cursor"], count))
+        return fail("最终理解没有追平全部转写");
+    if (!audio_backlog_empty(end) || !audio_backlog_empty(transcript) ||
+        !audio_backlog_empty(understanding))
+        return fail("服务端音频积压未清空或发生丢帧");
+    return true;
+}
+
+static void log_unseen_final_transcripts(const Json::Value& snapshot,
+                                         const std::vector<std::string>& streamed_texts) {
+    const Json::Value& transcript = snapshot["transcript"];
+    std::vector<bool> consumed(streamed_texts.size(), false);
+    for (const Json::Value& item : transcript) {
+        if (item.get("is_final", false).asBool() == false) continue;
+        const std::string text = item.get("text", "").asString();
+        bool already_streamed = false;
+        for (size_t i = 0; i < streamed_texts.size(); ++i) {
+            if (!consumed[i] && streamed_texts[i] == text) {
+                consumed[i] = true;
+                already_streamed = true;
+                break;
+            }
+        }
+        if (already_streamed) continue;
+        LOGF("[转写] %s: %s", item.get("speaker", "说话人").asString().c_str(),
+             text.c_str());
+    }
+}
+
 static Json::Value audio_frame_msg(const int16_t* pcm, size_t n) {
     Json::Value f;
     f["type"] = "audio";
@@ -52,15 +254,16 @@ static Json::Value audio_frame_msg(const int16_t* pcm, size_t n) {
 }
 
 int main(int argc, char** argv) {
-    std::string server = "ws://192.168.31.97:8700";
+    std::string server = "wss://clare.vinex.top/voice-api";
     std::string topic = "会议纪要助手demo";
-    std::string mode = "full";
+    std::string mode = "listen";
     std::string cafile = "/root/bin/cacert.pem";
     int duplex_upload = 0;      // 1 = 播放回答期间仍上行转写（全双工）；0 = 半双工时序（默认）
     int auto_host_every = 0;    // >0 时每 N 秒自动发起一轮问答（无人值守演示）
     int vad_enable = 1;         // 转写上行静音门控（VAD）：只传有声帧，省 80%+ 带宽
     int vad_threshold = 0;      // VAD 帧 RMS 阈值；0 = 自适应（2.5×噪声底，下限 140）
     std::string inject_file;   // 非空：从 16kHz s16 文件喂帧（替代麦克风，联调诊断用）
+    std::string record_file = "/root/meeting_demo/latest-meeting.json";
     int debug_log = 0;         // 1 = 打印每 50 帧时序等诊断日志（默认关）
 
     for (int i = 1; i < argc; i++) {
@@ -78,10 +281,12 @@ int main(int argc, char** argv) {
         else if (a == "--vad") vad_enable = atoi(next("--vad").c_str());
         else if (a == "--vad-threshold") vad_threshold = atoi(next("--vad-threshold").c_str());
         else if (a == "--inject") inject_file = next("--inject");
+        else if (a == "--record") record_file = next("--record");
         else if (a == "--debug") debug_log = 1;
         else if (a == "-h" || a == "--help") {
             std::printf("usage: meeting_demo --server URL [--topic T] [--mode listen|host|full] "
-                        "[--cafile P] [--duplex-upload 0|1] [--auto-host-every N]\n");
+                        "[--cafile P] [--duplex-upload 0|1] [--auto-host-every N] "
+                        "[--record FILE]\n");
             return 0;
         } else {
             LOGF("unknown arg: %s", a.c_str());
@@ -94,7 +299,7 @@ int main(int argc, char** argv) {
     }
     const bool use_transcribe = (mode == "listen" || mode == "full");
     const bool use_host = (mode == "host" || mode == "full");
-    const bool use_understanding = (mode == "full");
+    const bool use_understanding = use_transcribe;
 
     // HTTP base：由 WS URL 换 scheme 得到（真实后端 http(s) 与 ws(s) 同源）
     std::string http_base = server;
@@ -152,6 +357,8 @@ int main(int argc, char** argv) {
     // ---- 3. WebSocket 传输（工厂按 scheme 选明文/TLS 实现）----
     std::unique_ptr<IWsTransport> ws_tr(make_ws_transport(server));
     std::unique_ptr<IWsTransport> ws_ho(make_ws_transport(server));
+    std::mutex streamed_finals_mutex;
+    std::vector<std::string> streamed_final_texts;
 
     auto attach_handlers = [&](IWsTransport& wst, const char* name, bool is_host) {
         wst.on_open = [name]() { LOGF("[%s] open", name); };
@@ -163,11 +370,16 @@ int main(int argc, char** argv) {
             LOGF("[%s] closed %d %s%s", name, code, reason.c_str(), hint);
         };
         if (!is_host) {
-            wst.on_message = [](const Json::Value& m) {
+            wst.on_message = [&](const Json::Value& m) {
                 if (!m.isObject()) return;
                 std::string t = m.get("type", "").asString();
                 if (t == "transcript") {
-                    LOGF("[转写%s] %s: %s", m.get("is_final", true).asBool() ? "" : "-中间",
+                    bool is_final = m.get("is_final", true).asBool();
+                    if (is_final) {
+                        std::lock_guard<std::mutex> lock(streamed_finals_mutex);
+                        streamed_final_texts.push_back(m.get("text", "").asString());
+                    }
+                    LOGF("[转写%s] %s: %s", is_final ? "" : "-中间",
                          m.get("speaker", "说话人").asString().c_str(),
                          m.get("text", "").asString().c_str());
                 }
@@ -456,11 +668,8 @@ int main(int argc, char** argv) {
                                  "", cafile, 8, ur) &&
                     ur.status == 200) {
                     try {
-                        Json::Value u;
-                        Json::CharReaderBuilder urb;
-                        std::string uerrs;
-                        std::istringstream uis(ur.body);
-                        if (Json::parseFromStream(urb, uis, &u, &uerrs) && u.isObject()) {
+                            Json::Value u;
+                            if (parse_json_object(ur.body, u)) {
                             long long rev = u.get("snapshotRevision", -1).asInt64();
                             if (rev != last_snap_rev) {
                                 last_snap_rev = rev;
@@ -518,7 +727,7 @@ int main(int argc, char** argv) {
             playback.clear();
             LOGF(">> stop 已发送");
         } else if (line == "q" || line == "Q") {
-            LOGF(">> 退出");
+            LOGF(">> 结束会议");
             g_quit.store(true);
         }
     }
@@ -530,11 +739,24 @@ int main(int argc, char** argv) {
     if (inject_thread.joinable()) inject_thread.join();
     if (auto_thread.joinable()) auto_thread.join();
     if (understanding_thread.joinable()) understanding_thread.join();
-    if (use_transcribe && ws_tr->is_open()) {
-        Json::Value m;
-        m["type"] = "end";
-        ws_tr->send_json(m);
-        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+    bool uplink_flush_ok = true;
+    if (use_transcribe) {
+        if (!ws_tr->is_open()) {
+            uplink_flush_ok = false;
+        } else {
+            Json::Value m;
+            m["type"] = "end";
+            uplink_flush_ok = ws_tr->send_json(m) && ws_tr->flush(8000);
+            // The server may emit the ASR tail after consuming end. Keep the
+            // socket readable briefly so that final reaches the streaming UI;
+            // the canonical HTTP transcript below remains the final authority.
+            if (uplink_flush_ok) {
+                for (int i = 0; i < 50 && ws_tr->is_open(); ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+        if (!uplink_flush_ok)
+            LOGF("[纪要失败] 转写通道断开或音频上行未完整排空");
     }
     LOGF("closing ws...");
     ws_tr->close();
@@ -548,10 +770,80 @@ int main(int argc, char** argv) {
 
     HttpResponse endr;
     bool end_ok = http_request("POST", http_base + "/api/session/" + session_id + "/end",
-                               "", cafile, 10, endr) &&
+                               "", cafile, 20, endr) &&
                   endr.status == 200;
     LOGF("session %s ended: status=%d body=%s", session_id.c_str(), endr.status,
          endr.body.c_str());
+
+    Json::Value end_json;
+    bool end_json_ok = end_ok && parse_json_object(endr.body, end_json);
+    bool analysis_final = end_json_ok && end_json.get("analysis_final", false).asBool();
+    Json::Value transcript_json;
+    Json::Value understanding_json;
+    bool transcript_ok = !use_understanding;
+    bool understanding_ok = !use_understanding;
+    bool snapshots_consistent = !use_understanding;
+    if (use_understanding && end_ok) {
+        HttpResponse tr;
+        transcript_ok = http_request("GET", http_base + "/api/session/" + session_id +
+                                               "/transcript",
+                                     "", cafile, 10, tr) &&
+                        tr.status == 200 && parse_json_object(tr.body, transcript_json) &&
+                        transcript_snapshot_complete(transcript_json);
+        HttpResponse ur;
+        understanding_ok = http_request("GET", http_base + "/api/session/" + session_id +
+                                                  "/understanding",
+                                        "", cafile, 10, ur) &&
+                           ur.status == 200 && parse_json_object(ur.body, understanding_json);
+        bool snapshot_final = understanding_ok &&
+                              understanding_snapshot_final(understanding_json);
+        std::string consistency_error;
+        snapshots_consistent = transcript_ok && snapshot_final && end_json_ok &&
+                               final_snapshots_consistent(session_id, end_json,
+                                                          transcript_json,
+                                                          understanding_json,
+                                                          consistency_error);
+        if (transcript_ok) {
+            std::vector<std::string> streamed;
+            {
+                std::lock_guard<std::mutex> lock(streamed_finals_mutex);
+                streamed = streamed_final_texts;
+            }
+            log_unseen_final_transcripts(transcript_json, streamed);
+        }
+        if (uplink_flush_ok && analysis_final && snapshots_consistent)
+            log_final_minutes(understanding_json);
+        else if (!analysis_final)
+            LOGF("[纪要失败] 服务端最终分析未完成");
+        else if (!transcript_ok)
+            LOGF("[纪要失败] 无法读取完整转写");
+        else if (!snapshot_final)
+            LOGF("[纪要失败] 服务端未返回最终理解快照");
+        else if (!snapshots_consistent)
+            LOGF("[纪要失败] 最终数据不一致: %s", consistency_error.c_str());
+        understanding_ok = snapshot_final;
+    }
+
+    const bool complete_minutes_ok = !use_understanding ||
+        (end_ok && end_json_ok && uplink_flush_ok && analysis_final && transcript_ok &&
+         understanding_ok && snapshots_consistent);
+    bool record_ok = !use_understanding || record_file.empty();
+    if (use_understanding && complete_minutes_ok && !record_file.empty()) {
+        Json::Value record;
+        record["schemaVersion"] = "1.0";
+        record["sessionId"] = session_id;
+        record["topic"] = topic;
+        record["end"] = end_json;
+        record["transcript"] = transcript_json;
+        record["understanding"] = understanding_json;
+        Json::StreamWriterBuilder record_writer;
+        record_writer["indentation"] = "  ";
+        record_writer["emitUTF8"] = true;
+        record_ok = write_file_atomic(record_file, Json::writeString(record_writer, record));
+        if (record_ok) LOGF("[纪要已保存] %s", record_file.c_str());
+        else LOGF("[纪要失败] 无法保存 %s", record_file.c_str());
+    }
     LOGF("bye.");
-    return end_ok ? 0 : 1;
+    const bool minutes_ok = complete_minutes_ok && record_ok;
+    return end_ok && minutes_ok ? 0 : 1;
 }
