@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# 构建 meeting_demo（会议纪要助手板端 demo：ALSA 采集/播放 + wss + minimp3）
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+BUILD_DIR=/workspace/build/echo-mate-meeting-demo
+INSTALL_DIR=/workspace/install/echo-mate-meeting-demo
+HOST_OUTPUT="${PROJECT_DIR}/out/meeting-demo"
+SYSROOT=/workspace/Echo-Mate/SDK/rv1106-sdk/sysdrv/source/buildroot/buildroot-2023.02.6/output/host/arm-buildroot-linux-uclibcgnueabihf/sysroot
+
+mkdir -p "${HOST_OUTPUT}"
+
+docker compose -f "${PROJECT_DIR}/compose.yaml" run --rm sdk bash -lc "
+  set -euo pipefail
+  export PKG_CONFIG_LIBDIR=${SYSROOT}/usr/lib/pkgconfig
+  export PKG_CONFIG_SYSROOT_DIR=${SYSROOT}
+  cmake \
+    -S /host-project/apps/meeting-demo \
+    -B ${BUILD_DIR} \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_TOOLCHAIN_FILE=/host-project/apps/meeting-demo/cmake/rv1106-toolchain.cmake \
+    -DCMAKE_INSTALL_PREFIX=${INSTALL_DIR}
+  cmake --build ${BUILD_DIR} --parallel 4
+  cmake --install ${BUILD_DIR}
+"
+
+docker compose -f "${PROJECT_DIR}/compose.yaml" run --rm \
+  -v "${HOST_OUTPUT}:/export" sdk bash -lc "
+    set -euo pipefail
+    cp -a ${INSTALL_DIR}/. /export/
+  "
+
+echo "meeting-demo package: ${HOST_OUTPUT}"

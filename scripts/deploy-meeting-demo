@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# 部署并运行 meeting_demo（会议纪要助手板端 demo）
+#
+# 流程：构建（可选）→ 推送 /root/meeting_demo → 板端调教音频参数 → 前台运行
+# 前台运行保留 stdin，可在终端里按 Enter 提问 / s 打断 / q 退出（Ctrl+C 亦可）。
+#
+# 用法:
+#   scripts/deploy-meeting-demo [--no-build] [--server ws://HOST:PORT]
+#                               [--mode listen|host|full] [--auto-host-every N]
+#                               [--local-mock]
+#
+# --local-mock：把纯 stdlib mock 后端和 MP3 资产一并部署到板端并在板端
+#   常驻启动，demo 用 ws://127.0.0.1:8700 回环连接，不依赖 Wi-Fi/外网。
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+MOCK_SRC="${PROJECT_DIR}/../confer-sum/mock-server"
+PACKAGE_DIR="${PROJECT_DIR}/out/meeting-demo"
+REMOTE_DIR=/root/meeting_demo
+REMOTE_MOCK=/root/mock-server
+SERVER="ws://192.168.31.97:8700"
+MODE=full
+EXTRA_ARGS=""
+build=1
+local_mock=0
+
+usage() {
+  cat <<'USAGE_EOF'
+Usage: scripts/deploy-meeting-demo [--no-build] [--server ws://HOST:PORT]
+                                  [--mode listen|host|full] [--auto-host-every N]
+                                  [--local-mock]
+
+Builds, deploys, and runs the meeting demo. Runs in the foreground so console
+keys work: Enter = ask / end asking, s = interrupt, q = quit.
+--local-mock deploys the stdlib mock backend onto the board (loopback).
+USAGE_EOF
+}
+
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --no-build) build=0 ;;
+    --server) SERVER="$2"; shift ;;
+    --mode) MODE="$2"; shift ;;
+    --auto-host-every) EXTRA_ARGS="--auto-host-every $2"; shift ;;
+    --local-mock) local_mock=1; SERVER="ws://127.0.0.1:8700" ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if ! adb devices | grep -qw device; then
+  echo "error: no ADB device (board offline?)" >&2
+  exit 1
+fi
+
+if [[ "$build" -eq 1 ]]; then
+  "${SCRIPT_DIR}/build-meeting-demo"
+fi
+test -x "${PACKAGE_DIR}/meeting_demo"
+
+adb shell "mkdir -p ${REMOTE_DIR}" >/dev/null
+adb push "${PACKAGE_DIR}/." "${REMOTE_DIR}/" >/dev/null
+adb shell "chmod 0755 ${REMOTE_DIR}/meeting_demo"
+
+# 本地 mock：部署纯 stdlib 后端到板端并常驻（不依赖 Wi-Fi）
+if [[ "$local_mock" -eq 1 ]]; then
+  test -f "${MOCK_SRC}/mock_server_stdlib.py"
+  adb shell "mkdir -p ${REMOTE_MOCK}/assets" >/dev/null
+  adb push "${MOCK_SRC}/mock_server_stdlib.py" "${REMOTE_MOCK}/" >/dev/null
+  adb push "${MOCK_SRC}/assets/s1.mp3" "${MOCK_SRC}/assets/s2.mp3" \
+           "${MOCK_SRC}/assets/s3.mp3" "${REMOTE_MOCK}/assets/" >/dev/null
+  adb shell "killall mock_server_stdlib.py 2>/dev/null || true; sleep 1; \
+    cd ${REMOTE_MOCK} && start-stop-daemon -S -b -x /usr/bin/python3 -- \
+    mock_server_stdlib.py --port 8700 --assets ${REMOTE_MOCK}/assets" >/dev/null
+  sleep 2
+  if ! adb shell "wget -q -T 3 -O - http://127.0.0.1:8700/health" | grep -q '"ok"'; then
+    echo "error: board mock failed to start" >&2
+    exit 1
+  fi
+  echo "board mock up at ws://127.0.0.1:8700"
+fi
+
+# 板端运行（前台，保留交互）
+echo "running meeting_demo: server=${SERVER} mode=${MODE}"
+echo "（Enter=提问/结束提问  s=打断  q/Ctrl+C=退出）"
+set +e
+adb shell "APP=${REMOTE_DIR} SERVER=${SERVER} MODE=${MODE} ${REMOTE_DIR}/meeting-demo-run.sh" 2>&1 \
+  | tr -d '\r' | tee "${PROJECT_DIR}/out/meeting-demo-run.log"
+adb_status=${PIPESTATUS[0]}
+set -e
+if [[ "$adb_status" -ne 0 ]]; then
+  echo "warning: adb shell exited with ${adb_status}" >&2
+fi
+echo "done"
