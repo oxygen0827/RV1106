@@ -302,3 +302,16 @@
   环境不够；**Opus 16kbps（~2KB/s）压缩上行可留 3 倍余量**，板端 libopus
   已有、AIChat 链路已验证，需软件方在 clare-voice-api 协议上支持 Opus
   解码（新增讨论议题）。
+
+## 2026-08-16：板端 wss/TLS 链路验证矩阵 + 喇叭声学回环
+
+- wss 验证（`apps/meeting-demo/tls_probe`，板端实测）：
+  1. `wss://echo.websocket.org` + CA bundle（150 张根证书）→ 握手 + JSON
+     echo 往返 PASS；
+  2. 自签证书 + CA bundle → 正确拒绝（verify_peer 生效）；
+  3. 自签证书作 cafile（自定义 CA 场景，对应公司内网 CA）→ TLS 握手 PASS。
+  结论：无论后端用公共 CA 还是内网自签 CA（把证书给到 cafile 即可），
+  板端 wss 链路都已就绪。
+- 喇叭声学回环：板端 `arecord`(16k) 同时 `aplay` 24kHz PCM，录音与所播
+  音频互相关峰值/噪声基线 = **194×**（lag 0.9s 处），证明 MP3 解码→
+  24kHz ALSA→喇叭的物理出声链路完整。

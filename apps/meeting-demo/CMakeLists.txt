@@ -18,29 +18,39 @@ add_executable(meeting_demo
     audio.cc
 )
 
-target_include_directories(meeting_demo PRIVATE
+add_executable(tls_probe
+    tls_probe.cc
+    util.cc
+    http_client.cc
+    wss_transport.cc
+)
+
+foreach(tgt meeting_demo tls_probe)
+target_include_directories(${tgt} PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
     ${JSONCPP_INCLUDE_DIRS}
     ${OPENSSL_INCLUDE_DIRS}
 )
+endforeach()
 
-target_link_directories(meeting_demo PRIVATE
+foreach(tgt meeting_demo tls_probe)
+target_link_directories(${tgt} PRIVATE
     ${JSONCPP_LIBRARY_DIRS}
     ${OPENSSL_LIBRARY_DIRS}
     ${ALSA_LIBRARY_DIRS}
 )
-
-target_link_libraries(meeting_demo PRIVATE
+target_link_libraries(${tgt} PRIVATE
     ${OPENSSL_LIBRARIES}
     ${JSONCPP_LIBRARIES}
     ${ALSA_LIBRARIES}
     pthread
 )
+endforeach()
 
 set_target_properties(meeting_demo PROPERTIES
     BUILD_RPATH "$ORIGIN"
     INSTALL_RPATH "$ORIGIN"
 )
 
-install(TARGETS meeting_demo DESTINATION .)
+install(TARGETS meeting_demo tls_probe DESTINATION .)
