@@ -4,10 +4,10 @@
  * 页面职责：
  *   1. fork/exec /root/meeting_demo/meeting-demo-run.sh（SERVER 优先读
  *      /root/meeting_demo/server.conf，缺省 ws://192.168.31.97:8700）。
- *   2. 后台读线程从子进程 stdout/stderr 管道收行，推入环形缓冲；
- *      300ms LVGL 定时器在 UI 线程取出行并追加到转写文本区（LVGL
+ *   2. 后台读线程从子进程合并后的 stdout/stderr 管道收行，推入环形缓冲；
+ *      500ms LVGL 定时器在 UI 线程取出行并追加到转写文本区（LVGL
  *      对象只由 UI 线程触碰）。
- *   3. 触屏按钮向子进程 stdin 写控制键：按住提问=Enter、打断=s、退出=q。
+ *   3. 基础 Demo 使用 listen 模式；退出按钮向子进程 stdin 写 q。
  *
  * 生命周期：init 启动进程；deinit/返回按钮先写 q 退出子进程（SIGTERM/
  * SIGKILL 兜底），join 读线程后销毁定时器。可重复进入/退出。
@@ -26,11 +26,11 @@
 ///////////////////// 常量 ////////////////////
 
 #define LINE_MAX_BYTES    400   // 单行最大字节（约 130 个汉字）
-#define LOG_MAX_LINES     60    // 环形缓冲最多保留行数
+#define LOG_MAX_LINES     40    // 环形缓冲最多保留行数（控制整段重渲染成本）
 #define DISP_MAX_BYTES    (LOG_MAX_LINES * (LINE_MAX_BYTES + 1) + 64)  // 显示缓冲
 
 #define MEETING_SH_CMD \
-    "APP=/root/meeting_demo MODE=full " \
+    "APP=/root/meeting_demo MODE=listen " \
     "SERVER=$(cat /root/meeting_demo/server.conf 2>/dev/null || echo ws://192.168.31.97:8700) " \
     "exec /root/meeting_demo/meeting-demo-run.sh"
 
@@ -55,7 +55,7 @@ typedef struct {
 
 static meeting_run_t g_run;
 
-static lv_timer_t *g_ui_timer;
+static lv_timer_t *g_ui_timer;    // 500ms：转写文本 + 状态 + 按钮显隐
 static lv_obj_t   *g_status_label;
 static lv_obj_t   *g_text_label;
 static lv_obj_t   *g_text_container;
@@ -100,10 +100,12 @@ static int state_child_running(void)
     return r;
 }
 
-static int state_stdin_fd(void)
+// 原子地取走 stdin 写端，确保读线程与退出路径只有一方关闭。
+static int state_take_stdin_fd(void)
 {
     pthread_mutex_lock(&g_run.mtx);
     int fd = g_run.stdin_fd;
+    g_run.stdin_fd = -1;
     pthread_mutex_unlock(&g_run.mtx);
     return fd;
 }
@@ -124,7 +126,6 @@ static void *meeting_reader_thread(void *arg)
     char buf[512];
     char line[LINE_MAX_BYTES];
     size_t line_len = 0;
-
     for (;;) {
         ssize_t n = read(g_run.stdout_fd, buf, sizeof(buf));
         if (n > 0) {
@@ -142,10 +143,10 @@ static void *meeting_reader_thread(void *arg)
             continue;
         }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
-            usleep(30000);   // 30ms 轮询
+            usleep(30000);
             continue;
         }
-        break;   // EOF（子进程退出）或读错误
+        break;
     }
 
     if (line_len > 0) ring_append(line, line_len);
@@ -160,8 +161,9 @@ static void *meeting_reader_thread(void *arg)
     } else {
         ring_append("[meeting_demo 已结束]", strlen("[meeting_demo 已结束]"));
     }
-    close(g_run.stdout_fd);
-    g_run.stdout_fd = -1;
+    if (g_run.stdout_fd >= 0) { close(g_run.stdout_fd); g_run.stdout_fd = -1; }
+    int stdin_fd = state_take_stdin_fd();
+    if (stdin_fd >= 0) close(stdin_fd);
     state_set_child_running(0);
     return NULL;
 }
@@ -170,6 +172,12 @@ static void *meeting_reader_thread(void *arg)
 
 static int meeting_start(void)
 {
+    // 清理可能残留的旧实例：页面/DeskBot 异常退出后孤儿 meeting_demo 会
+    // 一直占着声卡，导致新实例 playback/capture open busy。先 TERM 再 KILL。
+    (void)system("killall -q -TERM meeting_demo 2>/dev/null");
+    usleep(300000);
+    (void)system("killall -q -KILL meeting_demo 2>/dev/null");
+
     int in_pipe[2], out_pipe[2];
     if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0) return -1;
 
@@ -210,32 +218,31 @@ static int meeting_start(void)
 
 static void meeting_stdin_write(const char *s)
 {
-    int fd = state_stdin_fd();
+    pthread_mutex_lock(&g_run.mtx);
+    int fd = g_run.stdin_fd;
     if (fd >= 0) {
         ssize_t n = write(fd, s, strlen(s));
         (void)n;
     }
+    pthread_mutex_unlock(&g_run.mtx);
 }
 
 static void meeting_stop(void)
 {
     // 1. 写 q 让子进程优雅退出（meeting_demo 的 stdin 协议），随后关写端
-    int fd = state_stdin_fd();
+    int fd = state_take_stdin_fd();
     if (fd >= 0) {
         write(fd, "q\n", 2);
         close(fd);
-        pthread_mutex_lock(&g_run.mtx);
-        g_run.stdin_fd = -1;
-        pthread_mutex_unlock(&g_run.mtx);
     }
 
     // 2. 等子进程退出（读线程收尸并置 child_running=0）。
     //    q 路径在本地 mock 下 <1s；真实服务端 session/end HTTP 实测 5~15s
-    //    （板端 Wi-Fi 上行慢）。为避免阻塞 UI 过久：只给 4s 宽限，
+    //    （板端 Wi-Fi 上行慢）。基础 Demo 给 12s 宽限，
     //    超时按进程组 TERM/KILL 兜底——服务端已收到 end 请求会自行收尾，
     //    不留下孤儿 meeting_demo。
     int i;
-    for (i = 0; i < 80; i++) {           // 最多 4s
+    for (i = 0; i < 240; i++) {          // 最多 12s
         if (!state_child_running()) break;
         usleep(50000);
     }
@@ -374,6 +381,8 @@ static void ui_event_interrupt(lv_event_t *e)
 
 void ui_MeetingDemoPage_init(void)
 {
+    // 子进程可能在 UI 写控制键前自行退出；EPIPE 只作为写失败处理。
+    signal(SIGPIPE, SIG_IGN);
     // 状态初始化
     memset(&g_run, 0, sizeof(g_run));
     g_run.pid = -1;
@@ -426,7 +435,7 @@ void ui_MeetingDemoPage_init(void)
     // 转写文本区（滚动容器 + 自动换行 label）
     g_text_container = lv_obj_create(root);
     lv_obj_set_pos(g_text_container, 5, 38);
-    lv_obj_set_size(g_text_container, 310, 112);
+    lv_obj_set_size(g_text_container, 310, 102);
     lv_obj_set_style_bg_color(g_text_container, lv_color_hex(0x14181D), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_opa(g_text_container, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(g_text_container, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -473,6 +482,7 @@ void ui_MeetingDemoPage_init(void)
     lv_label_set_text(ask_label, "按住提问");
     lv_obj_set_style_text_font(ask_label, &ui_font_meeting14, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_color(ask_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_add_flag(ask_btn, LV_OBJ_FLAG_HIDDEN);  // Host 问答不进入基础 Demo
 
     lv_obj_t *intr_btn = lv_button_create(root);
     lv_obj_set_pos(intr_btn, 135, 196);
@@ -488,10 +498,11 @@ void ui_MeetingDemoPage_init(void)
     lv_label_set_text(intr_label, "打断");
     lv_obj_set_style_text_font(intr_label, &ui_font_meeting14, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_color(intr_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_add_flag(intr_btn, LV_OBJ_FLAG_HIDDEN);  // 随 Host 问答一并延后
 
     lv_obj_t *quit_btn = lv_button_create(root);
-    lv_obj_set_pos(quit_btn, 220, 196);
-    lv_obj_set_size(quit_btn, 90, 40);
+    lv_obj_set_pos(quit_btn, 5, 196);
+    lv_obj_set_size(quit_btn, 305, 40);
     lv_obj_add_flag(quit_btn, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
     lv_obj_remove_flag(quit_btn, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_radius(quit_btn, 10, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -507,7 +518,7 @@ void ui_MeetingDemoPage_init(void)
     // 初始化状态 + UI 定时器（进程由「开启会议」按钮启动）
     g_started_once = 0;
     g_stopping = 0;
-    g_ui_timer = lv_timer_create(ui_timer_cb, 300, NULL);
+    g_ui_timer = lv_timer_create(ui_timer_cb, 500, NULL);   // 转写/状态
 
     lv_scr_load_anim(root, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 100, 0, true);
 }

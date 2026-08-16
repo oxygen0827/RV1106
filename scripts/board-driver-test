@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+passes=0
+failures=0
+warnings=0
+
+pass() { printf 'PASS  %s\n' "$1"; passes=$((passes + 1)); }
+fail() { printf 'FAIL  %s\n' "$1"; failures=$((failures + 1)); }
+warn() { printf 'WARN  %s\n' "$1"; warnings=$((warnings + 1)); }
+board() { adb shell "$1" | tr -d '\r'; }
+
+if ! adb devices | grep -qw device; then
+  echo "FAIL  ADB device is not connected" >&2
+  exit 1
+fi
+
+echo "Echo-Mate driver audit"
+board 'uname -a; printf "boot: "; cat /proc/cmdline; printf "memory: "; grep MemTotal /proc/meminfo'
+echo
+
+[[ "$(board 'cat /sys/class/graphics/fb0/name 2>/dev/null')" == "fb_st7789v" ]] \
+  && pass "display: fb_st7789v on /dev/fb0" \
+  || fail "display: expected fb_st7789v on /dev/fb0"
+touch_event="$(board 'for e in /sys/class/input/event*; do test -e "$e/device/name" || continue; test "$(cat "$e/device/name")" = fts_ts && basename "$e" && break; done')"
+if [[ "${touch_event}" =~ ^event[0-9]+$ ]]; then
+  pass "touch: FT6336/fts_ts on ${touch_event}"
+else
+  input_devices="$(board 'for e in /sys/class/input/event*; do test -e "$e/device/name" || continue; printf "%s=%s " "$(basename "$e")" "$(cat "$e/device/name")"; done')"
+  fail "touch: fts_ts missing on all eventN (found: ${input_devices:-none}; check FT6336 power/FPC/I2C3 address 0x38)"
+fi
+board 'aplay -l 2>/dev/null' | grep -q 'rv-acodec' \
+  && pass "audio playback: rv-acodec enumerated" \
+  || fail "audio playback: rv-acodec missing"
+board 'arecord -l 2>/dev/null' | grep -q 'rv-acodec' \
+  && pass "audio capture: rv-acodec enumerated" \
+  || fail "audio capture: rv-acodec missing"
+board 'lsmod' | grep -q '^r8723bs ' \
+  && pass "Wi-Fi: RTL8723BS driver loaded" \
+  || fail "Wi-Fi: RTL8723BS driver missing"
+board 'ip link show wlan0 2>/dev/null' | grep -q 'wlan0' \
+  && pass "Wi-Fi: wlan0 interface present" \
+  || fail "Wi-Fi: wlan0 interface missing"
+
+if board 'test -e /sys/class/bluetooth/hci0'; then
+  pass "Bluetooth: hci0 present"
+else
+  warn "Bluetooth: bluetoothd runs but no hci0 is registered (official support is still experimental)"
+fi
+
+board 'test -c /dev/rknpu' \
+  && board 'lsmod' | grep -q '^rknpu ' \
+  && pass "NPU: /dev/rknpu and rknpu module present" \
+  || fail "NPU: runtime device or driver missing"
+board 'lsmod' | grep -q '^rga3 ' \
+  && pass "RGA: rga3 module loaded" \
+  || fail "RGA: rga3 module missing"
+board 'lsmod' | grep -q '^mpp_vcodec ' \
+  && pass "video codec: mpp_vcodec module loaded" \
+  || fail "video codec: mpp_vcodec module missing"
+board 'mount' | grep -q 'ubi0:rootfs' \
+  && pass "storage: SPI NAND UBIFS root mounted" \
+  || fail "storage: expected SPI NAND UBIFS root"
+
+camera_entity="$(board "media-ctl -d /dev/media0 -p 2>/dev/null | grep -E 'm[0-9][0-9]_[bf]_gc1084' | head -n 1 || true")"
+if [[ -n "${camera_entity}" ]] && board 'v4l2-ctl -d /dev/video0 --all >/dev/null 2>&1'; then
+  pass "camera: GC1084 sensor is bound into the media graph"
+  if board 'v4l2-ctl -d /dev/video0 --set-fmt-video=width=1280,height=720,pixelformat=BA10 --stream-mmap=3 --stream-count=30 --stream-to=/dev/null >/tmp/camera-stream.log 2>&1'; then
+    pass "camera: captured 30 frames from /dev/video0 (RAW10 BA10)"
+  else
+    warn "camera: GC1084 bound but 30-frame capture incomplete (MIPI link may be unstable)"
+    board 'cat /tmp/camera-stream.log 2>/dev/null; rm -f /tmp/camera-stream.log'
+  fi
+else
+  fail "camera: no GC1084 sensor is bound; /dev/video0 cannot capture"
+  board "for d in /sys/bus/i2c/devices/4-*; do test -e \"\$d/name\" || continue; printf '%s: ' \"\$d\"; cat \"\$d/name\"; test -L \"\$d/driver\" && echo bound || echo unbound; done"
+  board 'printf "I2C4 scan:\n"; i2cdetect -y 4 2>/dev/null || true'
+  warn "camera: verify FPC Pin 1/2 3.3V, Pin 7/8 1.8V pull-ups, Pin 19 MCLK and Pin 5 reset during sensor probe"
+  warn "camera: GC1084 uses I2C address 0x37, not 0x30 (SC series)"
+fi
+
+board 'lsmod' | grep -q '^motor ' \
+  && warn "motor: module is loaded; actuation intentionally skipped until wiring is confirmed" \
+  || warn "motor: no module loaded and no motor hardware acceptance was requested"
+
+printf '\nSummary: %d passed, %d failed, %d warnings\n' "${passes}" "${failures}" "${warnings}"
+[[ "${failures}" -eq 0 ]]

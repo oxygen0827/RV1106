@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.15)
 
-project(echo_mate_meeting_demo LANGUAGES CXX)
+project(echo_mate_meeting_demo LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,6 +24,14 @@ add_executable(tls_probe
     http_client.cc
     wss_transport.cc
 )
+
+add_executable(deskbot_launcher_smoke
+    tests/deskbot-launcher-smoke.c
+)
+set_target_properties(deskbot_launcher_smoke PROPERTIES
+    OUTPUT_NAME "deskbot-launcher-smoke"
+)
+target_link_libraries(deskbot_launcher_smoke PRIVATE pthread)
 
 foreach(tgt meeting_demo tls_probe)
 target_include_directories(${tgt} PRIVATE
@@ -53,4 +61,4 @@ set_target_properties(meeting_demo PROPERTIES
     INSTALL_RPATH "$ORIGIN"
 )
 
-install(TARGETS meeting_demo tls_probe DESTINATION .)
+install(TARGETS meeting_demo tls_probe deskbot_launcher_smoke DESTINATION .)

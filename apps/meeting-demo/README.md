@@ -1,10 +1,11 @@
 # meeting_demo —— 会议纪要助手板端 demo（Echo-Mate RV1106）
 
-对接 clare-voice-api（API_DOC v1.0）协议的板端应用：
+对接 clare-voice-api（API_DOC v2.0）协议的板端应用：
 
 ```
 ALSA 采集 16kHz/mono/s16（100ms 帧）
-  → Base64 + JSON → WS 上行（/ws/transcribe 持续推流；/ws/host 问答）
+  → 二进制 PCM → /ws/transcribe 持续推流
+  → Base64 + JSON → /ws/host 问答
   ← transcription / answer_text（流式）/ answer_audio（24kHz MP3 逐句）
   → minimp3 软解 → 播放队列 → ALSA 24kHz 边收边播
 ```
@@ -23,6 +24,10 @@ ALSA 采集 16kHz/mono/s16（100ms 帧）
 ./scripts/deploy-meeting-demo --local-mock     # 部署 + 板端本地 mock + 运行
 ./scripts/deploy-meeting-demo --server ws://192.168.31.97:8700 --mode full
 ```
+
+部署脚本会同时更新 `meeting_demo` 与 `meeting-demo-run.sh`；`full` 模式会等
+transcribe/host 两条 WS 都打开，再预热 ASR 2 秒并启动采集。弱网预热只发送
+一帧静音，避免连续静音 PCM 排在真实语音前面。
 
 控制台：`Enter`=按住提问/再按结束提问  `s`=打断  `q`=退出（优雅收尾）
 无人值守：`--auto-host-every N` 每 N 秒自动提问一轮。
@@ -44,12 +49,14 @@ meeting_demo 本身是控制台程序，不出画面。桌面上给它加图标/
 - 桌面第一页左下角（原 Memo 占位图标位置）出现绿色「会议」图标；
   点击进入 MeetingDemoPage。
 - 页面初始状态为「未开始」，显示全宽绿色「开启会议」按钮；
-  点击后 fork/exec `/root/meeting_demo/meeting-demo-run.sh`（full 模式），
-  板端开始录音并推流，转写/回答文本经子进程 stdout 管道实时流式显示在
+  点击后 fork/exec `/root/meeting_demo/meeting-demo-run.sh`（基础 Demo 默认 listen 模式），
+  板端开始录音并推流，partial/final 转写经子进程 stdout 管道实时显示在
   转写文本区（按钮自动隐藏，状态变「运行中」）。
-- 触屏按钮：`按住提问`=按住/松开各发一次 Enter、`打断`=s、`退出`=q 并返回桌面
-  （进程未运行时按提问/打断无副作用）。会议进程自行退出后状态变「已停止」，
+- 基础 Demo 仅保留 `开启会议` 和 `退出`；Host 提问/打断控件暂时隐藏。
+  会议进程自行退出后状态变「已停止」，
   「开启会议」按钮重新出现，可再次开启新会议。
+- `deskbot-launcher-smoke` 的 PASS 条件为 Session 创建、transcribe WS 打开、
+  partial/final、`/end=200`、`rc=0` 且无孤儿进程。
 - 服务器地址优先读 `/root/meeting_demo/server.conf`（一行 ws(s)://URL），
   缺省 `ws://192.168.31.97:8700`；板端本地 mock 时写成 `ws://127.0.0.1:8700`。
 - 部署包排除 `system_para.conf`：AIChat 令牌等板端配置不被模板覆盖；

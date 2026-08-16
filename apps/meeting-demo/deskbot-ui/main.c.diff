@@ -1,0 +1,76 @@
+diff --git a/main.c b/main.c
+--- a/main.c
++++ b/main.c
+@@ -1,10 +1,12 @@
+ #include "lvgl/lvgl.h"
+ #include "lvgl/demos/lv_demos.h"
++#include <dirent.h>
+ #include <unistd.h>
+ #include <pthread.h>
+ #include <time.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
+-
++
+ #include "gui_app/common/lv_lib.h"
+ #include "gui_app/ui.h"
+@@ -14,9 +16,55 @@ static const char *getenv_default(const char *name, const char *dflt)
+ }
+-
++
+ #if LV_USE_EVDEV
++static const char *find_touch_device(void)
++{
++    static char device[64];
++    const char *override = getenv("LV_LINUX_EVDEV_DEVICE");
++    if (override && override[0] != '\0') return override;
++
++    DIR *dir = opendir("/sys/class/input");
++    if (!dir) {
++        perror("open /sys/class/input");
++        return NULL;
++    }
++
++    struct dirent *entry;
++    while ((entry = readdir(dir)) != NULL) {
++        if (strncmp(entry->d_name, "event", 5) != 0) continue;
++
++        char name_path[128];
++        snprintf(name_path, sizeof(name_path),
++                 "/sys/class/input/%s/device/name", entry->d_name);
++        FILE *name_file = fopen(name_path, "r");
++        if (!name_file) continue;
++
++        char input_name[64] = {0};
++        char *read_ok = fgets(input_name, sizeof(input_name), name_file);
++        fclose(name_file);
++        if (!read_ok) continue;
++        input_name[strcspn(input_name, "\r\n")] = '\0';
++
++        if (strcmp(input_name, "fts_ts") == 0) {
++            snprintf(device, sizeof(device), "/dev/input/%s", entry->d_name);
++            closedir(dir);
++            return device;
++        }
++    }
++
++    closedir(dir);
++    return NULL;
++}
++
+ static void lv_linux_indev_init(void)
+ {
+-    lv_indev_t * touch;
+-    touch = lv_evdev_create(LV_INDEV_TYPE_POINTER, "/dev/input/event0");
++    const char *device = find_touch_device();
++    if (!device) {
++        fprintf(stderr, "touch input fts_ts not found\n");
++        return;
++    }
++
++    fprintf(stderr, "touch input: %s\n", device);
++    lv_indev_t *touch = lv_evdev_create(LV_INDEV_TYPE_POINTER, device);
++    if (!touch) fprintf(stderr, "touch input open failed: %s\n", device);
+ }
+ #endif

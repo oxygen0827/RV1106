@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# 部署带「会议纪要」入口的 DeskBot 到板端并重启
+#
+# 流程：校验 ADB → 备份旧 main → 停 DeskBot → 解包新 bin（不含
+# system_para.conf，板端令牌/网络配置不被覆盖）→ 校验配置未变 →
+# 确保 meeting_demo 与 server.conf 就绪 → 重启 DeskBot → 验收。
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+TARBALL="${PROJECT_DIR}/out/deskbot-meeting/deskbot-meeting-bin.tar.gz"
+REMOTE_DIR=/root/bin
+
+if ! adb devices | grep -qw device; then
+  echo "error: no ADB device (board offline?)" >&2
+  exit 1
+fi
+test -f "${TARBALL}" || { echo "error: 缺少 ${TARBALL}，先运行 scripts/build-deskbot-meeting" >&2; exit 1; }
+
+# 1. 备份当前 main 到宿主机（板端 rootfs 仅剩 ~2MB，不在板上 cp）
+BACKUP_DIR="${PROJECT_DIR}/out/deskbot-meeting/rollback"
+mkdir -p "${BACKUP_DIR}"
+adb pull /root/bin/main "${BACKUP_DIR}/main.prev-$(date +%Y%m%d-%H%M%S)" >/dev/null \
+  || echo "warning: 备份当前 main 失败（继续）" >&2
+
+# 2. 停止 DeskBot（先 TERM 再 KILL 兜底）
+adb shell 'pidof main >/dev/null && kill $(pidof main) 2>/dev/null; true'
+adb shell 'i=0; while pidof main >/dev/null && [ $i -lt 20 ]; do sleep 0.5; i=$((i+1)); done; pidof main >/dev/null && kill -9 $(pidof main) 2>/dev/null; true'
+sleep 1
+adb shell 'pidof main >/dev/null && echo "warning: main still alive" || echo "deskbot stopped"'
+
+# 3. 推送并解包（板端 busybox tar 无 -z 且 -a 不生效，用 gzip 管道；
+#    tar 包已排除 system_para.conf）
+adb push "${TARBALL}" /tmp/deskbot-meeting-bin.tar.gz >/dev/null
+adb shell "cd ${REMOTE_DIR} && gzip -dc /tmp/deskbot-meeting-bin.tar.gz | tar x && rm -f /tmp/deskbot-meeting-bin.tar.gz && chmod 0755 main"
+
+# 3b. 校验部署的 main 与构建产物一致（解包失败时立刻暴露）
+NEW_SHA=$(tar xOzf "${TARBALL}" ./main | shasum -a 256 | cut -d' ' -f1)
+BOARD_SHA=$(adb shell 'sha256sum /root/bin/main' | tr -d '\r' | cut -d' ' -f1)
+if [[ "${NEW_SHA}" == "${BOARD_SHA}" ]]; then
+  echo "main sha OK: ${BOARD_SHA}"
+else
+  echo "warning: main sha mismatch new=${NEW_SHA} board=${BOARD_SHA}" >&2
+fi
+
+# 4. 配置完整性校验（system_para.conf 是 key=value 行；不打印令牌内容）
+adb shell 'TOKEN=$(sed -n "s/^AIChat_server_token=//p" /root/bin/system_para.conf | head -1); echo "AIChat token len=${#TOKEN}"'
+adb shell 'echo "config size: $(wc -c < /root/bin/system_para.conf) bytes"'
+
+# 5. 确保 meeting_demo 与服务器配置就绪
+adb shell 'mkdir -p /root/meeting_demo; \
+  test -f /root/meeting_demo/server.conf || echo ws://192.168.31.97:8700 > /root/meeting_demo/server.conf; \
+  test -x /root/meeting_demo/meeting_demo || echo "warning: /root/meeting_demo/meeting_demo 不存在（先跑 scripts/deploy-meeting-demo）"'
+adb shell 'echo "server.conf: $(cat /root/meeting_demo/server.conf)"'
+
+# 6. 重启 DeskBot（与 init 脚本一致：从 /root/bin 启动；无 -o 日志选项）
+adb shell "cd ${REMOTE_DIR} && start-stop-daemon -S -b -x ./main"
+sleep 4
+adb shell 'pidof main && echo "deskbot running" || echo "deskbot FAILED to start"'
+
+echo "deploy done"

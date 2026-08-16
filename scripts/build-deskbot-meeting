@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# 构建带「会议纪要」入口的 DeskBot 并导出板端部署包
+#
+# 流程（全部在 Docker SDK 容器内完成）：
+#   1. 同步 apps/meeting-demo/deskbot-ui 的新页面源码与字库进 DeskBot 源码树
+#   2. 幂等注入：
+#      - main.c：环境变量优先，否则按 sysfs 名称发现 fts_ts
+#      - ui.c 注册页面（patch，-N 已应用自动跳过）
+#      - ui.h 字体声明（sed 注入，GNU patch 对该文件匹配异常，不用 patch）
+#      - ui_HomePage.c 会议图标（未打过整块 patch；打过则 sed 换字体名）
+#   3. 重新 cmake 配置（GLOB 拾取新文件）+ 交叉编译
+#   4. 导出 bin/ 为 tar.gz（排除 system_para.conf，避免覆盖板端令牌/配置）
+#
+# 产物：out/deskbot-meeting/deskbot-meeting-bin.tar.gz
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+HOST_OUTPUT="${PROJECT_DIR}/out/deskbot-meeting"
+
+mkdir -p "${HOST_OUTPUT}"
+
+docker compose -f "${PROJECT_DIR}/compose.yaml" run --rm \
+  -v "${HOST_OUTPUT}:/export" sdk bash -lc '
+set -euo pipefail
+D=/workspace/Echo-Mate/Demo/DeskBot_demo
+UI=/host-project/apps/meeting-demo/deskbot-ui
+
+# 1. 同步新页面源码 + 字库（页面目录内的 .c 被 gui_app 的 GLOB_RECURSE 拾取）
+mkdir -p "${D}/gui_app/pages/ui_MeetingDemoPage"
+cp -a "${UI}"/ui_MeetingDemoPage.c \
+      "${UI}"/ui_MeetingDemoPage.h \
+      "${UI}"/fonts/ui_font_meeting14.c \
+      "${UI}"/fonts/ui_font_meeting22.c \
+      "${D}/gui_app/pages/ui_MeetingDemoPage/"
+# lv_font_conv 1.5.2 按 LVGL8 的 LV_VERSION_CHECK 宏生成守卫，LVGL9 已无该宏；
+# 且 LVGL9 移除了 dsc 的 cache 成员。用上下文感知方式归一化（幂等）：
+python3 - "${D}/gui_app/pages/ui_MeetingDemoPage/ui_font_meeting14.c" \
+          "${D}/gui_app/pages/ui_MeetingDemoPage/ui_font_meeting22.c" <<'PYEOF'
+import sys
+for path in sys.argv[1:]:
+    lines = open(path).read().split("\n")
+    out = []
+    for i, ln in enumerate(lines):
+        nxt2 = "\n".join(lines[i+1:i+3]).strip() if i+1 < len(lines) else ""
+        s = ln.strip()
+        if s in ("#if LVGL_VERSION_MAJOR >= 8", "#if LV_VERSION_CHECK(8, 0, 0)"):
+            if "lv_font_fmt_txt_glyph_cache_t cache;" in nxt2 or ".cache = &cache" in nxt2:
+                out.append("#if LVGL_VERSION_MAJOR == 8")   # LVGL8 专属 cache
+            else:
+                out.append("#if LVGL_VERSION_MAJOR >= 8")
+        elif s == "#if LV_VERSION_CHECK(7, 4, 0) || LVGL_VERSION_MAJOR >= 8":
+            out.append("#if LVGL_VERSION_MAJOR >= 8")
+        else:
+            out.append(ln)
+    open(path, "w").write("\n".join(out))
+PYEOF
+
+cd "${D}"
+
+# 2. main.c：按设备名发现 FT6336，避免 adc-keys/event 编号变化抢占 event0
+patch -p1 -N < "${UI}"/main.c.diff || true
+rm -f main.c.rej
+
+# 3. ui.c：注册 MeetingDemoPage（patch，幂等）
+patch -p1 -N < "${UI}"/ui.c.diff || true
+rm -f gui_app/ui.c.rej
+
+# 4. ui.h：字体声明（sed 注入，幂等；GNU patch 对该文件匹配异常，勿用 patch）
+if ! grep -q "LV_FONT_DECLARE(ui_font_meeting14);" gui_app/ui.h; then
+  sed -i "/LV_FONT_DECLARE(ui_font_NuberBig90);/a LV_FONT_DECLARE(ui_font_meeting14);\nLV_FONT_DECLARE(ui_font_meeting22);" gui_app/ui.h
+fi
+
+# 5. ui_HomePage.c：会议图标（新树整块 patch；已应用过则仅把图标字体换为新字库）
+if grep -q "ui_MeetingBtn" gui_app/pages/ui_HomePage/ui_HomePage.c; then
+  sed -i "/ui_MeetingIcon.*ui_font_heiti22/s/ui_font_heiti22/ui_font_meeting22/" \
+    gui_app/pages/ui_HomePage/ui_HomePage.c
+else
+  patch -p1 -N < "${UI}"/ui_HomePage.c.diff || true
+  rm -f gui_app/pages/ui_HomePage/ui_HomePage.c.rej
+fi
+
+# 6. 校验注入结果，失败立即终止
+grep -q "LV_LINUX_EVDEV_DEVICE" main.c \
+  || { echo "FATAL: main.c 未加入触摸设备覆盖配置"; exit 1; }
+grep -q "strcmp(input_name, \"fts_ts\")" main.c \
+  || { echo "FATAL: main.c 未按 fts_ts 名称发现触摸设备"; exit 1; }
+if grep -q "/dev/input/event0" main.c; then
+  echo "FATAL: main.c 仍硬编码 /dev/input/event0"
+  exit 1
+fi
+grep -q "touch input open failed" main.c \
+  || { echo "FATAL: main.c 未检查 lv_evdev_create 结果"; exit 1; }
+grep -q "ui_MeetingDemoPage/ui_MeetingDemoPage.h" gui_app/ui.c \
+  || { echo "FATAL: ui.c 未注册 MeetingDemoPage"; exit 1; }
+grep -q '"MeetingDemoPage"' gui_app/ui.c \
+  || { echo "FATAL: ui.c 未注册 MeetingDemoPage 页面"; exit 1; }
+grep -q "LV_FONT_DECLARE(ui_font_meeting14);" gui_app/ui.h \
+  || { echo "FATAL: ui.h 未声明 meeting 字库"; exit 1; }
+grep -q "ui_MeetingBtn" gui_app/pages/ui_HomePage/ui_HomePage.c \
+  || { echo "FATAL: ui_HomePage.c 未加入会议图标"; exit 1; }
+grep -q "ui_font_meeting22" gui_app/pages/ui_HomePage/ui_HomePage.c \
+  || { echo "FATAL: 会议图标未使用 meeting22 字库"; exit 1; }
+echo "inject OK"
+
+# 7. 重新配置（GLOB_RECURSE 拾取新 .c）+ 编译
+mkdir -p build
+cd build
+cmake .. -DTARGET_ARM=ON >/dev/null
+make -j4
+
+# 8. 导出部署包（排除 system_para.conf）
+rm -rf /tmp/deskbot-export
+mkdir -p /tmp/deskbot-export
+cp -a ../bin/. /tmp/deskbot-export/
+rm -f /tmp/deskbot-export/system_para.conf
+tar czf /export/deskbot-meeting-bin.tar.gz -C /tmp/deskbot-export .
+echo "deskbot main: $(stat -c%s /tmp/deskbot-export/main) bytes"
+'
+
+echo "DeskBot 部署包：${HOST_OUTPUT}/deskbot-meeting-bin.tar.gz"

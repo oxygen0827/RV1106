@@ -1,7 +1,7 @@
 // 会议纪要助手板端 demo（Echo-Mate RV1106）
 //
 // 链路：ALSA 采集 16kHz/mono/s16 PCM（100ms 帧）
-//       → Base64 + JSON → WS 上行（/ws/transcribe 持续推流；/ws/host 问答）
+//       → binary PCM → /ws/transcribe；Base64 + JSON → /ws/host
 //       ← transcription / answer_text（流式）/ answer_audio（24kHz MP3，逐句）
 //       → minimp3 软解 → 播放队列 → ALSA 24kHz 边收边播
 //
@@ -59,8 +59,9 @@ int main(int argc, char** argv) {
     int duplex_upload = 0;      // 1 = 播放回答期间仍上行转写（全双工）；0 = 半双工时序（默认）
     int auto_host_every = 0;    // >0 时每 N 秒自动发起一轮问答（无人值守演示）
     int vad_enable = 1;         // 转写上行静音门控（VAD）：只传有声帧，省 80%+ 带宽
-    int vad_threshold = 250;    // VAD 帧 RMS 阈值（16bit PCM，实测噪声 ~50-130）
+    int vad_threshold = 0;      // VAD 帧 RMS 阈值；0 = 自适应（2.5×噪声底，下限 140）
     std::string inject_file;   // 非空：从 16kHz s16 文件喂帧（替代麦克风，联调诊断用）
+    int debug_log = 0;         // 1 = 打印每 50 帧时序等诊断日志（默认关）
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -77,6 +78,7 @@ int main(int argc, char** argv) {
         else if (a == "--vad") vad_enable = atoi(next("--vad").c_str());
         else if (a == "--vad-threshold") vad_threshold = atoi(next("--vad-threshold").c_str());
         else if (a == "--inject") inject_file = next("--inject");
+        else if (a == "--debug") debug_log = 1;
         else if (a == "-h" || a == "--help") {
             std::printf("usage: meeting_demo --server URL [--topic T] [--mode listen|host|full] "
                         "[--cafile P] [--duplex-upload 0|1] [--auto-host-every N]\n");
@@ -92,6 +94,7 @@ int main(int argc, char** argv) {
     }
     const bool use_transcribe = (mode == "listen" || mode == "full");
     const bool use_host = (mode == "host" || mode == "full");
+    const bool use_understanding = (mode == "full");
 
     // HTTP base：由 WS URL 换 scheme 得到（真实后端 http(s) 与 ws(s) 同源）
     std::string http_base = server;
@@ -132,10 +135,17 @@ int main(int argc, char** argv) {
 
     // ---- 2. 音频：采集 + 播放 ----
     Playback playback;
-    if (!playback.start(24000)) {
-        LOGF("playback init failed");
+    auto abort_session = [&](const char* reason) -> int {
+        LOGF("startup failed: %s", reason);
+        g_quit.store(true);
+        HttpResponse endr;
+        http_request("POST", http_base + "/api/session/" + session_id + "/end",
+                     "", cafile, 10, endr);
+        LOGF("session %s aborted: status=%d", session_id.c_str(), endr.status);
         return 1;
-    }
+    };
+    // 基础转写 (listen) 不依赖播放设备，避免 host 旁路阻断建会。
+    if (use_host && !playback.start(24000)) return abort_session("playback init failed");
     AudioCapture capture;
     Mp3Decoder mp3;
 
@@ -147,16 +157,17 @@ int main(int argc, char** argv) {
         wst.on_open = [name]() { LOGF("[%s] open", name); };
         wst.on_fail = [name](const std::string& e) { LOGF("[%s] fail: %s", name, e.c_str()); };
         wst.on_close = [name](int code, const std::string& reason) {
-            const char* hint = code == 4009 ? "（同 Session 已有转写发布者）"
-                              : code == 4500 ? "（服务端 ASR 建连失败，可重连）"
-                              : code == 4004 ? "（Session 不存在或已结束）" : "";
+            const char* hint = code == 4009 ? "(同 Session 已有转写发布者)"
+                              : code == 4500 ? "(服务端 ASR 建连失败，可重连)"
+                              : code == 4004 ? "(Session 不存在或已结束)" : "";
             LOGF("[%s] closed %d %s%s", name, code, reason.c_str(), hint);
         };
         if (!is_host) {
             wst.on_message = [](const Json::Value& m) {
+                if (!m.isObject()) return;
                 std::string t = m.get("type", "").asString();
                 if (t == "transcript") {
-                    LOGF("[转写%s] %s: %s", m.get("is_final", true).asBool() ? "" : "·中间",
+                    LOGF("[转写%s] %s: %s", m.get("is_final", true).asBool() ? "" : "-中间",
                          m.get("speaker", "说话人").asString().c_str(),
                          m.get("text", "").asString().c_str());
                 }
@@ -168,7 +179,7 @@ int main(int argc, char** argv) {
                     LOGF("[%s] session 已结束，不再重连", name);
                     return;
                 }
-                LOGF("[%s] 断线（%d %s），2s 后重连…", name, code, reason.c_str());
+                LOGF("[%s] 断线 (%d %s)，2s 后重连...", name, code, reason.c_str());
                 std::thread([&]() {
                     std::this_thread::sleep_for(std::chrono::seconds(2));
                     if (g_quit.load()) return;
@@ -180,6 +191,7 @@ int main(int argc, char** argv) {
             return;
         }
         wst.on_message = [&](const Json::Value& m) {
+            if (!m.isObject()) return;
             std::string t = m.get("type", "").asString();
             if (t == "transcription") {
                 LOGF("[host] Q: %s", m.get("text", "").asString().c_str());
@@ -216,24 +228,52 @@ int main(int argc, char** argv) {
         };
     };
 
+    auto abort_startup = [&](const char* reason) -> int {
+        playback.stop();
+        return abort_session(reason);
+    };
+
     if (use_transcribe) {
         attach_handlers(*ws_tr, "transcribe", false);
         ws_tr->start();
         if (!ws_tr->connect(server + "/ws/transcribe/" + session_id, cafile)) {
-            LOGF("transcribe connect failed");
-            return 1;
+            return abort_startup("transcribe connect failed");
         }
     }
     if (use_host) {
         attach_handlers(*ws_ho, "host", true);
         ws_ho->start();
         if (!ws_ho->connect(server + "/ws/host/" + session_id, cafile)) {
-            LOGF("host connect failed");
-            return 1;
+            return abort_startup("host connect failed");
         }
     }
 
     // ---- 4. 采集 → 上行 ----
+    // 所需通道全部握手完成后才开采集，避免 send 在 !open 时被静默丢弃。
+    auto required_ws_open = [&]() {
+        return (!use_transcribe || ws_tr->is_open()) && (!use_host || ws_ho->is_open());
+    };
+    for (int i = 0; i < 250 && !g_quit.load() && !required_ws_open(); i++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!required_ws_open()) {
+        return abort_startup("required WebSocket handshake timed out");
+    }
+
+    // 服务端在进入收帧循环前已完成 ASR connect。留 2 秒预热时间，再发一帧
+    // 静音作为首帧；不要发送 2 秒连续 PCM，否则弱网上行会积压 64KB 静音。
+    if (use_transcribe) {
+        LOGF("等待 2 秒让服务端 ASR 预热...");
+        for (int i = 0; i < 20 && !g_quit.load() && required_ws_open(); i++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!required_ws_open() || g_quit.load()) {
+            return abort_startup("WebSocket closed during ASR warmup");
+        }
+        std::vector<int16_t> sil(1600, 0);
+        ws_tr->send_binary(reinterpret_cast<const uint8_t*>(sil.data()),
+                           sil.size() * sizeof(int16_t));
+    }
     // 半双工时序：回答播放期间暂停转写上行，避免喇叭回声污染 ASR（议题2 默认方案）
     auto uplink_paused = [&]() {
         return !duplex_upload && (g_answering.load() || !playback.queue_empty());
@@ -241,14 +281,13 @@ int main(int argc, char** argv) {
 
     std::atomic<int> frame_seq{0};
     // 采集/注入共用的帧回调
-    // VAD 状态：前视环（起始填充 4 帧）+ 拖尾（有声后延续 1.5s）
+    // VAD 状态：前视环（最近 8 帧 / 800ms）+ 拖尾（有声后延续 3s）
     struct VadState {
-        std::vector<int16_t> ring[4];
+        std::vector<int16_t> ring[8];
         int ring_fill = 0, ring_head = 0;
         int hangover = 0;
         bool in_speech = false;
     } vad;
-    // 采集/注入共用的帧回调（VAD + 上行分派）
     // 采集/注入共用的帧回调（VAD + 上行分派）
     std::function<void(const int16_t*, size_t)> cb_inject = [&, vad](const int16_t* pcm, size_t n) mutable {
             int seq = frame_seq.fetch_add(1) + 1;
@@ -257,7 +296,17 @@ int main(int argc, char** argv) {
             double sum = 0;
             for (size_t i = 0; i < n; i++) sum += (double)pcm[i] * pcm[i];
             int rms = (int)std::sqrt(sum / n);
-            bool voice = (rms >= vad_threshold);
+            // 自适应阈值：静音帧 EMA 估计噪声底，阈值 = max(140, 2.5×底)
+            static double noise_floor = 100.0;
+            int thr = vad_threshold;
+            if (thr <= 0) {
+                bool loud = (rms > noise_floor * 2.5 && rms > 140);
+                if (!loud) noise_floor = 0.9 * noise_floor + 0.1 * rms;
+                thr = (int)std::max(140.0, 2.5 * noise_floor);
+            }
+            bool voice = (rms >= thr);
+            if (debug_log && (seq % 100 == 0 || voice))
+                LOGF("rms=%d thr=%d floor=%.0f voice=%d", rms, thr, noise_floor, voice ? 1 : 0);
 
             auto send_tr = [&](const int16_t* p, size_t len) {
                 if (use_transcribe && !uplink_paused())
@@ -270,14 +319,15 @@ int main(int argc, char** argv) {
                     if (voice) {
                         if (!vad.in_speech) {  // 起始：冲掉前视环
                             for (int i = 0; i < vad.ring_fill; i++) {
-                                auto& f = vad.ring[(vad.ring_head + i) % 4];
+                                auto& f = vad.ring[(vad.ring_head + i) % 8];
                                 send_tr(f.data(), f.size());
                             }
                             vad.ring_fill = 0;
+                            vad.ring_head = 0;
                             vad.in_speech = true;
                             LOGF("VAD: 语音起始 @frame#%d (rms=%d)", seq, rms);
                         }
-                        vad.hangover = 15;
+                        vad.hangover = 30;
                         send_tr(pcm, n);
                     } else {
                         if (vad.in_speech && vad.hangover > 0) {
@@ -289,11 +339,14 @@ int main(int argc, char** argv) {
                             }
                         } else {
                             vad.in_speech = false;
-                            // 静音帧进前视环（为起始填充）
-                            if (vad.ring_fill < 4) {
-                                vad.ring[vad.ring_head].assign(pcm, pcm + n);
-                                vad.ring_head = (vad.ring_head + 1) % 4;
+                            // ring_head 始终指向最旧帧；未满时追加，满后覆盖并滚动。
+                            if (vad.ring_fill < 8) {
+                                int tail = (vad.ring_head + vad.ring_fill) % 8;
+                                vad.ring[tail].assign(pcm, pcm + n);
                                 vad.ring_fill++;
+                            } else {
+                                vad.ring[vad.ring_head].assign(pcm, pcm + n);
+                                vad.ring_head = (vad.ring_head + 1) % 8;
                             }
                         }
                     }
@@ -313,8 +366,14 @@ int main(int argc, char** argv) {
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now() - t0)
                           .count();
-            if (seq <= 3 || seq % 50 == 0)
+            if (debug_log && (seq <= 3 || seq % 50 == 0))
                 LOGF("capture frame #%d sent in %lldms", seq, (long long)ms);
+            // 环境噪声提示（30s 一次，常显）：便于现场判断麦克风音量/阈值
+            static int last_noise_seq = -300;
+            if (seq - last_noise_seq >= 300) {
+                last_noise_seq = seq;
+                LOGF("环境噪声 rms~%d (语音触发值 %d)，说话应超过此值", rms, thr);
+            }
             if (use_host && g_asking.load()) {
                 Json::Value f = audio_frame_msg(pcm, n);
                 ws_ho->send_json(f);
@@ -322,9 +381,10 @@ int main(int argc, char** argv) {
     };
 
     // 文件注入模式（联调诊断）：从 16kHz s16 文件按 100ms 节奏喂帧
+    std::thread inject_thread;
     if (!inject_file.empty()) {
-        LOGF("inject mode: %s（麦克风采集停用）", inject_file.c_str());
-        std::thread([&]() {
+        LOGF("inject mode: %s (麦克风采集停用)", inject_file.c_str());
+        inject_thread = std::thread([&]() {
             FILE* fp = std::fopen(inject_file.c_str(), "rb");
             if (!fp) {
                 LOGF("inject: cannot open %s", inject_file.c_str());
@@ -342,17 +402,16 @@ int main(int argc, char** argv) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
             std::fclose(fp);
-        }).detach();
-        LOGF("inject thread started（Ctrl+C/q 退出）");
-    } else     if (!capture.start(16000, cb_inject)) {
-        LOGF("capture init failed");
-        return 1;
+        });
+        LOGF("inject thread started (Ctrl+C/q 退出)");
+    } else if (!capture.start(16000, cb_inject)) {
+        return abort_startup("capture init failed");
     }
 
     // ---- 5. 控制台 + 自动演示 ----
-    LOGF("ready. 控制台：Enter=按住提问/结束提问  s=打断  q=退出");
+    LOGF("ready. 控制台: Enter=按住提问/结束提问  s=打断  q=退出");
     if (auto_host_every > 0)
-        LOGF("自动演示：每 %d 秒自动提问一轮", auto_host_every);
+        LOGF("自动演示: 每 %d 秒自动提问一轮", auto_host_every);
 
     std::thread auto_thread;
     if (auto_host_every > 0 && use_host) {
@@ -366,7 +425,9 @@ int main(int argc, char** argv) {
                 if (g_asking.load() || g_answering.load()) continue;
                 LOGF("[auto] 开始提问（4 秒）...");
                 g_asking.store(true);
-                std::this_thread::sleep_for(std::chrono::seconds(4));
+                for (int i = 0; i < 40 && !g_quit.load(); i++)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                if (g_quit.load()) break;
                 g_asking.store(false);
                 Json::Value m;
                 m["type"] = "end_of_speech";
@@ -382,31 +443,36 @@ int main(int argc, char** argv) {
     // “理解”轮询线程：每 5s 拉全量快照，snapshotRevision 变化时显示 headline
     // （独立线程，避免阻塞控制台输入与自动问答）
     std::thread understanding_thread;
-    if (use_transcribe) {
+    if (use_understanding) {
         understanding_thread = std::thread([&]() {
             long long last_snap_rev = -1;
             while (!g_quit.load()) {
-                std::this_thread::sleep_for(std::chrono::seconds(5));
+                for (int i = 0; i < 50 && !g_quit.load(); i++)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 if (g_quit.load()) break;
                 HttpResponse ur;
                 if (http_request("GET", http_base + "/api/session/" + session_id +
                                            "/understanding",
                                  "", cafile, 8, ur) &&
                     ur.status == 200) {
-                    Json::Value u;
-                    Json::CharReaderBuilder urb;
-                    std::string uerrs;
-                    std::istringstream uis(ur.body);
-                    if (Json::parseFromStream(urb, uis, &u, &uerrs)) {
-                        long long rev = u.get("snapshotRevision", -1).asInt64();
-                        if (rev != last_snap_rev) {
-                            last_snap_rev = rev;
-                            LOGF("[理解#%lld] %s", rev,
-                                 u.get("overview", Json::Value())
-                                     .get("headline", "（暂无）")
-                                     .asString()
-                                     .c_str());
+                    try {
+                        Json::Value u;
+                        Json::CharReaderBuilder urb;
+                        std::string uerrs;
+                        std::istringstream uis(ur.body);
+                        if (Json::parseFromStream(urb, uis, &u, &uerrs) && u.isObject()) {
+                            long long rev = u.get("snapshotRevision", -1).asInt64();
+                            if (rev != last_snap_rev) {
+                                last_snap_rev = rev;
+                                std::string headline = "(暂无)";
+                                const Json::Value& ov = u["overview"];
+                                if (ov.isObject() && ov["headline"].isString())
+                                    headline = ov["headline"].asString();
+                                LOGF("[理解#%lld] %s", rev, headline.c_str());
+                            }
                         }
+                    } catch (const std::exception& e) {
+                        LOGF("[理解] 解析异常: %s", e.what());
                     }
                 }
             }
@@ -436,7 +502,7 @@ int main(int argc, char** argv) {
     handle_line:
         if (line.empty() && use_host) {
             if (!g_asking.load()) {
-                LOGF(">> 开始提问（再按 Enter 结束）");
+                LOGF(">> 开始提问 (再按 Enter 结束)");
                 g_asking.store(true);
             } else {
                 g_asking.store(false);
@@ -457,8 +523,13 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ---- 6. 清理：end → 关 WS → end session → 停音频 ----
+    // ---- 6. 清理：停音频生产 → end → 关 WS → end session ----
     LOGF("shutting down...");
+    LOGF("stopping capture...");
+    capture.stop();
+    if (inject_thread.joinable()) inject_thread.join();
+    if (auto_thread.joinable()) auto_thread.join();
+    if (understanding_thread.joinable()) understanding_thread.join();
     if (use_transcribe && ws_tr->is_open()) {
         Json::Value m;
         m["type"] = "end";
@@ -472,17 +543,15 @@ int main(int argc, char** argv) {
     LOGF("stopping ws io...");
     ws_tr->stop();
     ws_ho->stop();
-    LOGF("stopping capture...");
-    if (auto_thread.joinable()) auto_thread.join();
-    if (understanding_thread.joinable()) understanding_thread.join();
-    capture.stop();
     LOGF("stopping playback...");
     playback.stop();
 
     HttpResponse endr;
-    http_request("POST", http_base + "/api/session/" + session_id + "/end", "", cafile, 10, endr);
+    bool end_ok = http_request("POST", http_base + "/api/session/" + session_id + "/end",
+                               "", cafile, 10, endr) &&
+                  endr.status == 200;
     LOGF("session %s ended: status=%d body=%s", session_id.c_str(), endr.status,
          endr.body.c_str());
     LOGF("bye.");
-    return 0;
+    return end_ok ? 0 : 1;
 }

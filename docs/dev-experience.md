@@ -367,6 +367,34 @@
 - 相关文件/命令：`apps/meeting-demo/deskbot-ui/fonts/`（OTF + 生成脚本
   `gen_font_chars.py`）、`scripts/build-deskbot-meeting`（同步+归一化）。
 
+## 2026-08-16：会议基础链路收口（listen 模式）
+
+- P0 链路固定为：DeskBot 开启会议 → POST Session → transcribe WS →
+  ALSA 16kHz PCM → VAD → binary PCM 上行 → partial/final 转写上屏 →
+  `q` → `/end=200` → `rc=0` 且无孤儿进程。
+- DeskBot 页面默认使用 `MODE=listen`；该模式不再打开播放设备，
+  Host WS、MP3 播放和 understanding 均不是开始会议的前置条件。
+- VAD 800ms 前视环改为真正的滚动缓存：未满时从尾部追加，满后覆盖
+  最旧帧；语音开始时按时间顺序冲刷，避免短停顿后发送空帧或陈旧帧。
+- `deskbot-launcher-smoke` 已纳入 CMake/部署包；本地 mock 连续两轮均检查
+  Session、WS、partial/final、`/end=200`、`rc=0`、进程组清理和无孤儿。
+- 启动时先等待 transcribe WS 打开，再给服务端 2 秒 ASR 预热并发送一帧静音，
+  随后启动采集；WS 未连接前上行会丢帧，连续发送 2 秒静音又会在弱网下把
+  真实语音挤到 64KB 积压之后，因此不要调整为提前采集或持续静音。
+- 页面启动新会议前会清理残留的 `meeting_demo`，避免旧进程持续占用声卡；
+  正常退出仍以 `q`、`/end` 和进程组收尾为主。
+- 板子重启后约 1 分钟内 DNS 可能尚未就绪，Session 创建会直接失败；当前
+  实测 Session 约 2 秒、WS 握手约 3–5 秒。该板 BusyBox `nslookup` 可能恒报
+  `No answer`，应以应用使用的 `getaddrinfo` 链路为准。
+- Host 问答、流式文本分帧与 Opus 上行全部延后。
+
+## 2026-08-16：移除采集电平可视化，聚焦会议基础链路
+
+- 按当前阶段范围，移除采集线程的 RMS 计算、stderr 旁路、页面柱状显示与
+  冒烟诊断；子进程 stderr 合并回 stdout，会议日志仍完整进入页面和测试。
+- VAD 保留并继续控制语音 PCM 上行；页面只保留开启会议、实时转写和退出，
+  冒烟测试继续覆盖 Session、转写 WS、partial/final、`/end=200` 和无孤儿。
+
 ## 2026-08-16：板端 wss/TLS 链路验证矩阵 + 喇叭声学回环
 
 - wss 验证（`apps/meeting-demo/tls_probe`，板端实测）：

@@ -17,6 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 MOCK_SRC="${PROJECT_DIR}/../confer-sum/mock-server"
 PACKAGE_DIR="${PROJECT_DIR}/out/meeting-demo"
+RUNNER_SRC="${PROJECT_DIR}/scripts/board/meeting-demo-run.sh"
 REMOTE_DIR=/root/meeting_demo
 REMOTE_MOCK=/root/mock-server
 SERVER="ws://192.168.31.97:8700"
@@ -42,7 +43,11 @@ while [[ "$#" -gt 0 ]]; do
     --no-build) build=0 ;;
     --server) SERVER="$2"; shift ;;
     --mode) MODE="$2"; shift ;;
-    --auto-host-every) EXTRA_ARGS="--auto-host-every $2"; shift ;;
+    --auto-host-every)
+      [[ "$2" =~ ^[1-9][0-9]*$ ]] || { echo "error: --auto-host-every must be a positive integer" >&2; exit 2; }
+      EXTRA_ARGS="--auto-host-every $2"
+      shift
+      ;;
     --local-mock) local_mock=1; SERVER="ws://127.0.0.1:8700" ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
@@ -59,10 +64,12 @@ if [[ "$build" -eq 1 ]]; then
   "${SCRIPT_DIR}/build-meeting-demo"
 fi
 test -x "${PACKAGE_DIR}/meeting_demo"
+test -f "${RUNNER_SRC}"
 
 adb shell "mkdir -p ${REMOTE_DIR}" >/dev/null
 adb push "${PACKAGE_DIR}/." "${REMOTE_DIR}/" >/dev/null
-adb shell "chmod 0755 ${REMOTE_DIR}/meeting_demo"
+adb push "${RUNNER_SRC}" "${REMOTE_DIR}/meeting-demo-run.sh" >/dev/null
+adb shell "chmod 0755 ${REMOTE_DIR}/meeting_demo ${REMOTE_DIR}/meeting-demo-run.sh"
 
 # 本地 mock：部署纯 stdlib 后端到板端并常驻（不依赖 Wi-Fi）
 if [[ "$local_mock" -eq 1 ]]; then
@@ -86,11 +93,12 @@ fi
 echo "running meeting_demo: server=${SERVER} mode=${MODE}"
 echo "（Enter=提问/结束提问  s=打断  q/Ctrl+C=退出）"
 set +e
-adb shell "APP=${REMOTE_DIR} SERVER=${SERVER} MODE=${MODE} ${REMOTE_DIR}/meeting-demo-run.sh" 2>&1 \
+adb shell "APP=${REMOTE_DIR} SERVER=${SERVER} MODE=${MODE} EXTRA_ARGS=\"${EXTRA_ARGS}\" ${REMOTE_DIR}/meeting-demo-run.sh" 2>&1 \
   | tr -d '\r' | tee "${PROJECT_DIR}/out/meeting-demo-run.log"
 adb_status=${PIPESTATUS[0]}
 set -e
 if [[ "$adb_status" -ne 0 ]]; then
-  echo "warning: adb shell exited with ${adb_status}" >&2
+  echo "error: board meeting demo exited with ${adb_status}" >&2
+  exit "$adb_status"
 fi
 echo "done"
