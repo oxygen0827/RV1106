@@ -18,8 +18,10 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 MOCK_SRC="${PROJECT_DIR}/../confer-sum/mock-server"
 PACKAGE_DIR="${PROJECT_DIR}/out/meeting-demo"
 RUNNER_SRC="${PROJECT_DIR}/scripts/board/meeting-demo-run.sh"
+DNS_HOOK_SRC="${PROJECT_DIR}/scripts/board/meeting-dns-hook.sh"
 REMOTE_DIR=/root/meeting_demo
 REMOTE_MOCK=/root/mock-server
+REMOTE_DNS_HOOK=/usr/share/udhcpc/default.script.d/50-meeting-public-dns
 SERVER="wss://clare.vinex.top/voice-api"
 MODE=listen
 EXTRA_ARGS=""
@@ -66,11 +68,14 @@ if [[ "$build" -eq 1 ]]; then
 fi
 test -x "${PACKAGE_DIR}/meeting_demo"
 test -f "${RUNNER_SRC}"
+test -f "${DNS_HOOK_SRC}"
 
 adb shell "mkdir -p ${REMOTE_DIR}" >/dev/null
 adb push "${PACKAGE_DIR}/." "${REMOTE_DIR}/" >/dev/null
 adb push "${RUNNER_SRC}" "${REMOTE_DIR}/meeting-demo-run.sh" >/dev/null
+adb push "${DNS_HOOK_SRC}" "${REMOTE_DNS_HOOK}" >/dev/null
 adb shell "chmod 0755 ${REMOTE_DIR}/meeting_demo ${REMOTE_DIR}/meeting-demo-run.sh"
+adb shell "chmod 0755 ${REMOTE_DNS_HOOK} && ${REMOTE_DNS_HOOK} apply"
 
 # 本地 mock：部署纯 stdlib 后端到板端并常驻（不依赖 Wi-Fi）
 if [[ "$local_mock" -eq 1 ]]; then
