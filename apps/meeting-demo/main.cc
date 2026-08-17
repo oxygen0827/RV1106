@@ -57,6 +57,20 @@ static bool parse_json_object(const std::string& body, Json::Value& out) {
     return Json::parseFromStream(rb, input, &out, &errors) && out.isObject();
 }
 
+static bool http_request_retry(const std::string& method, const std::string& url,
+                               const std::string& body, const std::string& cafile,
+                               int timeout_sec, int attempts, HttpResponse& out) {
+    for (int attempt = 1; attempt <= attempts; ++attempt) {
+        out = HttpResponse{};
+        if (http_request(method, url, body, cafile, timeout_sec, out)) return true;
+        if (attempt < attempts) {
+            LOGF("HTTP %s retry %d/%d", method.c_str(), attempt + 1, attempts);
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+    }
+    return false;
+}
+
 static std::string one_line(std::string value) {
     for (char& c : value) {
         if (c == '\r' || c == '\n' || c == '\t') c = ' ';
@@ -182,6 +196,13 @@ static bool completion_state_matches(const Json::Value& snapshot, Json::UInt64 c
     return matches(snapshot) && matches(snapshot["transcriptState"]);
 }
 
+static bool has_completion_state(const Json::Value& snapshot) {
+    return snapshot.isObject() &&
+           (snapshot.isMember("sourceComplete") ||
+            (snapshot["transcriptState"].isObject() &&
+             snapshot["transcriptState"].isMember("sourceComplete")));
+}
+
 static bool audio_backlog_empty(const Json::Value& snapshot) {
     const Json::Value& backlog = snapshot["audioBacklog"];
     return backlog.isObject() && count_equals(backlog["queued_ms"], 0) &&
@@ -193,7 +214,9 @@ static bool final_snapshots_consistent(const std::string& session_id,
                                        const Json::Value& end,
                                        const Json::Value& transcript,
                                        const Json::Value& understanding,
-                                       std::string& reason) {
+                                       std::string& reason,
+                                       bool& legacy_completion) {
+    legacy_completion = false;
     const Json::UInt64 count = transcript["count"].asUInt64();
     const Json::Value& analysis = understanding["analysis"];
     const Json::Value& decision = understanding["decisionState"];
@@ -211,17 +234,28 @@ static bool final_snapshots_consistent(const std::string& session_id,
         return fail("最终快照 Session 不一致");
     if (understanding.get("status", "").asString() != "ended")
         return fail("理解快照尚未结束");
-    if (!completion_state_matches(end, count) ||
-        !completion_state_matches(transcript, count) ||
-        !completion_state_matches(understanding, count))
-        return fail("服务端完整性状态未全部确认");
+    const bool any_completion_state = has_completion_state(end) ||
+                                      has_completion_state(transcript) ||
+                                      has_completion_state(understanding);
+    if (any_completion_state) {
+        if (!completion_state_matches(end, count) ||
+            !completion_state_matches(transcript, count) ||
+            !completion_state_matches(understanding, count))
+            return fail("服务端完整性状态未全部确认");
+    } else {
+        legacy_completion = true;
+    }
     if (!count_equals(analysis["lastSuccessfulCursor"], count) ||
         !count_equals(analysis["pendingTranscriptCount"], 0) ||
         !decision.isObject() || !count_equals(decision["cursor"], count))
         return fail("最终理解没有追平全部转写");
-    if (!audio_backlog_empty(end) || !audio_backlog_empty(transcript) ||
-        !audio_backlog_empty(understanding))
+    if (legacy_completion) {
+        if (!audio_backlog_empty(understanding))
+            return fail("旧版服务端音频积压未清空或发生丢帧");
+    } else if (!audio_backlog_empty(end) || !audio_backlog_empty(transcript) ||
+               !audio_backlog_empty(understanding)) {
         return fail("服务端音频积压未清空或发生丢帧");
+    }
     return true;
 }
 
@@ -320,8 +354,8 @@ int main(int argc, char** argv) {
     Json::StreamWriterBuilder w;
     w["indentation"] = "";
     HttpResponse resp;
-    if (!http_request("POST", http_base + "/api/session", Json::writeString(w, req), cafile, 10,
-                      resp) ||
+    if (!http_request_retry("POST", http_base + "/api/session",
+                            Json::writeString(w, req), cafile, 10, 3, resp) ||
         resp.status != 200) {
         LOGF("create session failed: status=%d body=%s", resp.status, resp.body.c_str());
         return 1;
@@ -384,21 +418,17 @@ int main(int argc, char** argv) {
                          m.get("text", "").asString().c_str());
                 }
             };
-            // 转写通道断线自动重连（服务端 keepalive ping 超时/网络抖动时保会议）
+            // 没有跨连接 PCM 缓冲时，自动重连会永久丢掉断线期间的语音，
+            // 却仍让 UI 显示“记录中”。立即结束并拒绝保存才符合完整性契约。
             wst.on_close = [&, name](int code, const std::string& reason) {
                 if (g_quit.load()) return;
                 if (code == 4004) {
                     LOGF("[%s] session 已结束，不再重连", name);
                     return;
                 }
-                LOGF("[%s] 断线 (%d %s)，2s 后重连...", name, code, reason.c_str());
-                std::thread([&]() {
-                    std::this_thread::sleep_for(std::chrono::seconds(2));
-                    if (g_quit.load()) return;
-                    static int attempt = 0;
-                    LOGF("[%s] 重连尝试 #%d", name, ++attempt);
-                    wst.connect(server + "/ws/transcribe/" + session_id, cafile);
-                }).detach();
+                LOGF("[纪要失败] %s 断线 (%d %s)，本场语音可能不完整",
+                     name, code, reason.c_str());
+                g_quit.store(true);
             };
             return;
         }
@@ -492,6 +522,10 @@ int main(int argc, char** argv) {
     };
 
     std::atomic<int> frame_seq{0};
+    // Used by the final validator to distinguish an intentionally empty
+    // meeting from a session where speech was uploaded but ASR produced no
+    // final line (for example after a broken upstream path).
+    std::atomic<int> speech_frames_seen{0};
     // 采集/注入共用的帧回调
     // VAD 状态：前视环（最近 8 帧 / 800ms）+ 拖尾（有声后延续 3s）
     struct VadState {
@@ -517,13 +551,17 @@ int main(int argc, char** argv) {
                 thr = (int)std::max(140.0, 2.5 * noise_floor);
             }
             bool voice = (rms >= thr);
+            if (voice) speech_frames_seen.fetch_add(1);
             if (debug_log && (seq % 100 == 0 || voice))
                 LOGF("rms=%d thr=%d floor=%.0f voice=%d", rms, thr, noise_floor, voice ? 1 : 0);
 
             auto send_tr = [&](const int16_t* p, size_t len) {
-                if (use_transcribe && !uplink_paused())
-                    ws_tr->send_binary(reinterpret_cast<const uint8_t*>(p),
-                                       len * sizeof(int16_t));
+                if (use_transcribe && !uplink_paused() &&
+                    !ws_tr->send_binary(reinterpret_cast<const uint8_t*>(p),
+                                        len * sizeof(int16_t))) {
+                    if (!g_quit.exchange(true))
+                        LOGF("[纪要失败] 音频上行队列已满或连接已断开");
+                }
             };
 
             if (use_transcribe) {
@@ -746,7 +784,9 @@ int main(int argc, char** argv) {
         } else {
             Json::Value m;
             m["type"] = "end";
-            uplink_flush_ok = ws_tr->send_json(m) && ws_tr->flush(8000);
+            // 弱网下 PCM 会先留在应用队列；等队列清空且底层持续空闲，
+            // 再由 HTTP 最终快照确认服务端确实收齐并分析完成。
+            uplink_flush_ok = ws_tr->send_json(m) && ws_tr->flush(240000);
             // The server may emit the ASR tail after consuming end. Keep the
             // socket readable briefly so that final reaches the streaming UI;
             // the canonical HTTP transcript below remains the final authority.
@@ -769,8 +809,9 @@ int main(int argc, char** argv) {
     playback.stop();
 
     HttpResponse endr;
-    bool end_ok = http_request("POST", http_base + "/api/session/" + session_id + "/end",
-                               "", cafile, 20, endr) &&
+    bool end_ok = http_request_retry(
+                      "POST", http_base + "/api/session/" + session_id + "/end",
+                      "", cafile, 90, 2, endr) &&
                   endr.status == 200;
     LOGF("session %s ended: status=%d body=%s", session_id.c_str(), endr.status,
          endr.body.c_str());
@@ -783,17 +824,19 @@ int main(int argc, char** argv) {
     bool transcript_ok = !use_understanding;
     bool understanding_ok = !use_understanding;
     bool snapshots_consistent = !use_understanding;
+    bool legacy_completion = false;
     if (use_understanding && end_ok) {
         HttpResponse tr;
-        transcript_ok = http_request("GET", http_base + "/api/session/" + session_id +
-                                               "/transcript",
-                                     "", cafile, 10, tr) &&
+        transcript_ok = http_request_retry("GET", http_base + "/api/session/" + session_id +
+                                                     "/transcript",
+                                           "", cafile, 20, 3, tr) &&
                         tr.status == 200 && parse_json_object(tr.body, transcript_json) &&
                         transcript_snapshot_complete(transcript_json);
         HttpResponse ur;
-        understanding_ok = http_request("GET", http_base + "/api/session/" + session_id +
-                                                  "/understanding",
-                                        "", cafile, 10, ur) &&
+        understanding_ok = http_request_retry(
+                               "GET", http_base + "/api/session/" + session_id +
+                                          "/understanding",
+                               "", cafile, 20, 3, ur) &&
                            ur.status == 200 && parse_json_object(ur.body, understanding_json);
         bool snapshot_final = understanding_ok &&
                               understanding_snapshot_final(understanding_json);
@@ -802,7 +845,13 @@ int main(int argc, char** argv) {
                                final_snapshots_consistent(session_id, end_json,
                                                           transcript_json,
                                                           understanding_json,
-                                                          consistency_error);
+                                                          consistency_error,
+                                                          legacy_completion);
+        if (snapshots_consistent && speech_frames_seen.load() > 0 &&
+            transcript_json["count"].asUInt64() == 0) {
+            snapshots_consistent = false;
+            consistency_error = "检测到语音上行但最终转写为空";
+        }
         if (transcript_ok) {
             std::vector<std::string> streamed;
             {
@@ -821,6 +870,8 @@ int main(int argc, char** argv) {
             LOGF("[纪要失败] 服务端未返回最终理解快照");
         else if (!snapshots_consistent)
             LOGF("[纪要失败] 最终数据不一致: %s", consistency_error.c_str());
+        if (snapshots_consistent && legacy_completion)
+            LOGF("[兼容] 旧版后端缺少完整性字段，已用零丢帧和快照一致性校验");
         understanding_ok = snapshot_final;
     }
 
@@ -836,6 +887,10 @@ int main(int argc, char** argv) {
         record["end"] = end_json;
         record["transcript"] = transcript_json;
         record["understanding"] = understanding_json;
+        record["validation"]["mode"] = legacy_completion
+            ? "legacy-server-fallback" : "server-completeness-v2";
+        record["validation"]["sourceComplete"] = true;
+        record["validation"]["analysisComplete"] = true;
         Json::StreamWriterBuilder record_writer;
         record_writer["indentation"] = "  ";
         record_writer["emitUTF8"] = true;

@@ -29,6 +29,7 @@
 #define LINE_MAX_BYTES    640   // 单行最大字节（约 210 个汉字）
 #define LOG_MAX_LINES     80    // 保留完整结束阶段，避免纪要字段被日志突发覆盖
 #define DISP_MAX_BYTES    (LOG_MAX_LINES * (LINE_MAX_BYTES + 1) + 64)  // 显示缓冲
+#define STOP_GRACE_TICKS  1200  // 500ms/tick，弱网 PCM 排空最多等待 10 分钟
 
 #define MEETING_SH_CMD \
     "APP=/root/meeting_demo MODE=listen " \
@@ -285,11 +286,11 @@ static void meeting_stop(void)
     meeting_request_stop();
 
     // 2. 等子进程退出（读线程收尸并置 child_running=0）。
-    //    真实服务端需要清空 ASR、生成最终理解并下载完整快照，给 60s 宽限。
+    //    真实服务端需要清空弱网 PCM、ASR、最终理解并下载完整快照，给 10min 宽限。
     //    超时按进程组 TERM/KILL 兜底——服务端已收到 end 请求会自行收尾，
     //    不留下孤儿 meeting_demo。
     int i;
-    for (i = 0; i < 1200; i++) {         // 最多 60s
+    for (i = 0; i < STOP_GRACE_TICKS * 10; i++) {  // 50ms/次，共 10min
         if (!state_child_running()) break;
         usleep(50000);
     }
@@ -413,8 +414,9 @@ static void ui_timer_cb(lv_timer_t *timer)
     int child_running = state_child_running();
     if (child_running && g_stopping) {
         g_stop_ticks++;
-        if (g_stop_ticks == 120) meeting_signal_process_group(SIGTERM);
-        else if (g_stop_ticks == 124) meeting_signal_process_group(SIGKILL);
+        if (g_stop_ticks == STOP_GRACE_TICKS) meeting_signal_process_group(SIGTERM);
+        else if (g_stop_ticks == STOP_GRACE_TICKS + 4)
+            meeting_signal_process_group(SIGKILL);
     }
     if (child_running) {
         if (g_stopping) {

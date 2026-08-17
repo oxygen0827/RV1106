@@ -12,11 +12,18 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <sys/ioctl.h>
 #include <thread>
-#include <vector>
+
+#ifndef TIOCOUTQ
+#define TIOCOUTQ 0x5411
+#endif
 
 // 传输层统一接口（与具体 WebSocket 配置解耦）
 struct IWsTransport {
@@ -26,7 +33,7 @@ struct IWsTransport {
     virtual bool send_json(const Json::Value& v) = 0;
     // 二进制帧（API_DOC v2：转写通道推荐直接发裸 PCM bytes）
     virtual bool send_binary(const uint8_t* data, size_t len) = 0;
-    // 等待应用队列和 websocketpp 写缓冲排空，保证控制帧排在全部 PCM 之后。
+    // 等待应用队列清空和底层写队列持续空闲，保证 end 排在全部 PCM 后面。
     virtual bool flush(int timeout_ms) = 0;
     virtual bool is_open() const = 0;
     virtual void close() = 0;
@@ -81,6 +88,7 @@ public:
 
     bool start() override {
         if (running_.load()) return true;
+        stopping_.store(false);
         running_.store(true);
         // work guard：io_service 空闲时也不让 run() 提前返回，
         // 否则 connect() 在 start() 之后排队会永远不被处理
@@ -99,6 +107,9 @@ public:
     bool connect(const std::string& url, const std::string& cafile) override {
         TlsSetup<ConfigT>::setup(client_, cafile);  // TLS 配置必须先于 get_connection
         remote_close_code_.store(0);
+        send_failed_.store(false);
+        queue_overflow_reported_.store(false);
+        pump_scheduled_.store(false);
 
         websocketpp::lib::error_code ec;
         auto conn = client_.get_connection(url, ec);
@@ -125,6 +136,7 @@ public:
         conn->set_open_handler([this](Hdl hdl) {
             (void)hdl;
             open_.store(true);
+            queue_cv_.notify_all();
             LOGF("ws connected");
             if (on_open) on_open();
         });
@@ -144,6 +156,7 @@ public:
             std::string reason = c ? c->get_remote_close_reason() : "";
             remote_close_code_.store(code);
             open_.store(false);
+            queue_cv_.notify_all();
             LOGF("ws closed code=%d reason=%s", code, reason.c_str());
             if (on_close) on_close(code, reason);
         });
@@ -153,88 +166,36 @@ public:
     }
 
     bool send_json(const Json::Value& v) override {
-        if (!open_.load()) {
+        if (!open_.load() || send_failed_.load()) {
             send_failed_.store(true);
             return false;
         }
         Json::StreamWriterBuilder w;
         w["indentation"] = "";
-        {
-            std::lock_guard<std::mutex> lk(q_mutex_);
-            out_queue_.push_back({true, Json::writeString(w, v)});
-        }
-        // post 到 io 线程执行（io_service::post 线程安全）
-        client_.get_io_service().post([this]() { flush_out_queue(); });
-        return true;
+        return enqueue({true, Json::writeString(w, v)});
     }
 
     bool send_binary(const uint8_t* data, size_t len) override {
-        if (!open_.load()) {
+        if (!open_.load() || send_failed_.load()) {
             send_failed_.store(true);
             return false;
         }
-        {
-            std::lock_guard<std::mutex> lk(q_mutex_);
-            out_queue_.push_back({false, std::string(reinterpret_cast<const char*>(data), len)});
-        }
-        client_.get_io_service().post([this]() { flush_out_queue(); });
-        return true;
+        return enqueue({false, std::string(reinterpret_cast<const char*>(data), len)});
     }
 
     bool flush(int timeout_ms) override {
-        client_.get_io_service().post([this]() { flush_out_queue(); });
         auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(timeout_ms);
+        std::unique_lock<std::mutex> lk(q_mutex_);
         while (std::chrono::steady_clock::now() < deadline) {
-            bool queue_empty;
-            {
-                std::lock_guard<std::mutex> lk(q_mutex_);
-                queue_empty = out_queue_.empty();
-            }
-            if (queue_empty && !flushing_.load() && !open_.load()) {
-                // A normal peer close after our end frame proves that all earlier
-                // WebSocket frames arrived in order, even if buffered_amount no
-                // longer reaches zero after the close handshake starts.
-                return remote_close_code_.load() == websocketpp::close::status::normal &&
-                       !send_failed_.load();
-            }
-            size_t buffered = 0;
-            try {
-                auto conn = client_.get_con_from_hdl(hdl_);
-                if (conn) buffered = conn->get_buffered_amount();
-            } catch (...) {
-                return false;
-            }
-            if (queue_empty && !flushing_.load() && buffered == 0)
-                return !send_failed_.load();
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            if (send_failed_.load()) return false;
+            const bool app_queue_empty = out_queue_.empty() && !pump_scheduled_.load();
+            if (app_queue_empty && !open_.load())
+                return remote_close_code_.load() == websocketpp::close::status::normal;
+            if (app_queue_empty) return true;
+            queue_cv_.wait_for(lk, std::chrono::milliseconds(50));
         }
         return false;
-    }
-
-    void flush_out_queue() {
-        flushing_.store(true);
-        std::vector<OutFrame> batch;
-        {
-            std::lock_guard<std::mutex> lk(q_mutex_);
-            batch.swap(out_queue_);
-        }
-        for (const OutFrame& f : batch) {
-            if (!open_.load()) {
-                send_failed_.store(true);
-                continue;
-            }
-            websocketpp::lib::error_code ec;
-            client_.send(hdl_, f.data,
-                         f.text ? websocketpp::frame::opcode::text
-                                : websocketpp::frame::opcode::binary,
-                         ec);
-            if (ec) {
-                send_failed_.store(true);
-                LOGF("ws send: %s", ec.message().c_str());
-            }
-        }
-        flushing_.store(false);
     }
 
     bool is_open() const override { return open_.load(); }
@@ -245,6 +206,8 @@ public:
     }
 
     void stop() override {
+        stopping_.store(true);
+        queue_cv_.notify_all();
         // 先删 work guard 再 stop，保证 run() 能退出；join 不依赖 running_ 状态
         if (work_) {
             delete work_;
@@ -253,6 +216,7 @@ public:
         {
             std::lock_guard<std::mutex> lk(q_mutex_);
             out_queue_.clear();
+            out_queue_bytes_ = 0;
         }
         try {
             client_.stop();
@@ -261,23 +225,126 @@ public:
     }
 
 private:
-    // 发送编组：非 io 线程直接 send 会让 asio reactor 的异步写注册与 epoll
-    // 竞争丢失（帧被无限期延迟）——统一 post 到 io 线程串行发送。
+    // 所有发送均在 io 线程串行执行。每轮只允许 websocketpp 保留一个
+    // 待发送帧，因此自动 Pong 最多排在一个 3200B PCM 帧之后。
     struct OutFrame {
         bool text;
         std::string data;
     };
+
+    bool enqueue(OutFrame frame) {
+        bool schedule = false;
+        {
+            std::lock_guard<std::mutex> lk(q_mutex_);
+            if (!frame.text && out_queue_bytes_ + frame.data.size() > kMaxQueueBytes) {
+                if (!queue_overflow_reported_.exchange(true))
+                    LOGF("ws audio queue overflow (%zuB); meeting is incomplete",
+                         out_queue_bytes_);
+                send_failed_.store(true);
+                return false;
+            }
+            out_queue_bytes_ += frame.data.size();
+            out_queue_.push_back(std::move(frame));
+            if (!pump_scheduled_.exchange(true)) schedule = true;
+        }
+        queue_cv_.notify_all();
+        if (schedule) client_.get_io_service().post([this]() { pump_once(); });
+        return true;
+    }
+
+    void schedule_pump_retry() {
+        client_.set_timer(25, [this](const websocketpp::lib::error_code& ec) {
+            if (!ec && !stopping_.load()) pump_once();
+        });
+    }
+
+    void fail_pump(const std::string& reason) {
+        if (!send_failed_.exchange(true)) LOGF("ws send: %s", reason.c_str());
+        pump_scheduled_.store(false);
+        queue_cv_.notify_all();
+    }
+
+    void pump_once() {
+        if (stopping_.load()) {
+            pump_scheduled_.store(false);
+            queue_cv_.notify_all();
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(q_mutex_);
+            if (out_queue_.empty()) {
+                pump_scheduled_.store(false);
+                queue_cv_.notify_all();
+                return;
+            }
+        }
+
+        websocketpp::lib::error_code ec;
+        auto conn = client_.get_con_from_hdl(hdl_, ec);
+        if (ec || !conn) {
+            fail_pump(ec ? ec.message() : "connection unavailable");
+            return;
+        }
+        if (conn->get_state() != websocketpp::session::state::open) {
+            fail_pump("connection is not open");
+            return;
+        }
+        int kernel_pending = 0;
+        if (::ioctl(conn->get_raw_socket().native_handle(), TIOCOUTQ,
+                    &kernel_pending) != 0) {
+            fail_pump("cannot inspect socket send queue");
+            return;
+        }
+        if (conn->get_buffered_amount() != 0 || kernel_pending > kMaxKernelPending) {
+            schedule_pump_retry();
+            return;
+        }
+
+        OutFrame frame;
+        {
+            std::lock_guard<std::mutex> lk(q_mutex_);
+            if (out_queue_.empty()) {
+                pump_scheduled_.store(false);
+                queue_cv_.notify_all();
+                return;
+            }
+            frame = std::move(out_queue_.front());
+            out_queue_bytes_ -= frame.data.size();
+            out_queue_.pop_front();
+        }
+
+        client_.send(hdl_, frame.data,
+                     frame.text ? websocketpp::frame::opcode::text
+                                : websocketpp::frame::opcode::binary,
+                     ec);
+        if (ec) {
+            fail_pump(ec.message());
+            return;
+        }
+        queue_cv_.notify_all();
+        schedule_pump_retry();
+    }
+
+    static const size_t kMaxQueueBytes = 2u * 1024u * 1024u;
+    // Keep the OS send queue shallow so WebSocket Pong control frames cannot
+    // sit behind seconds of PCM that websocketpp already handed to the kernel.
+    static const int kMaxKernelPending = 6400;
     Client client_;
     std::thread io_thread_;
     std::mutex q_mutex_;
-    std::vector<OutFrame> out_queue_;
+    std::condition_variable queue_cv_;
+    std::deque<OutFrame> out_queue_;
+    size_t out_queue_bytes_ = 0;
     boost::asio::io_service::work* work_ = nullptr;
     Hdl hdl_;
     std::atomic<bool> open_{false};
     std::atomic<bool> running_{false};
-    std::atomic<bool> flushing_{false};
+    std::atomic<bool> stopping_{false};
+    std::atomic<bool> pump_scheduled_{false};
     std::atomic<int> remote_close_code_{0};
     std::atomic<bool> send_failed_{false};
+    std::atomic<bool> queue_overflow_reported_{false};
 };
 
 // 工厂：按 URL scheme 选择明文/TLS 实现
