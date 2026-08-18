@@ -73,7 +73,6 @@ class IntentService:
         prompt = self.generate_prompt()
         self.intent_llm_model.clear_messages()
         self.intent_llm_model.set_model_sys_content(prompt)
-        self.intent_llm_model.add_message("user", user_input)
 
         try:
             response = self.intent_llm_model.get_LLM_response(user_input)

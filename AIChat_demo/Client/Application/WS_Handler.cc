@@ -19,15 +19,22 @@ void WSHandler::ws_msg_handle(const std::string& message, bool is_binary, Applic
             std::string typeStr = type.asString();
             if (typeStr == "vad") {
                 handle_vad_message(root, app);
+            } else if (typeStr == "voice") {
+                handle_voice_message(root, app);
             } else if (typeStr == "asr") {
-                handle_asr_message(root, app);
+                if (root["state"].asString() == "text" && root["text"].isString()) {
+                    const std::string text = root["text"].asString();
+                    USER_LOG_INFO("ASR transcription: %s", text.c_str());
+                    app->TranscriptQueue_.Enqueue(text);
+                } else if (root["state"].asString() == "end") {
+                    app->eventQueue_.Enqueue(static_cast<int>(AppEvent::asr_result));
+                }
             } else if (typeStr == "chat") {
                 handle_chat_message(root, app);
-            } else if (typeStr == "tts") {
-                handle_tts_message(root, app);
             } else if (typeStr == "error") {
                 USER_LOG_ERROR("server erro msg: %s", message.c_str());
-                app->eventQueue_.Enqueue(static_cast<int>(AppEvent::fault_happen));
+                app->eventQueue_.Enqueue(static_cast<int>(
+                    app->is_asr_mode() ? AppEvent::asr_result : AppEvent::fault_happen));
             } else {
                 USER_LOG_WARN("Unknown type: %s", typeStr.c_str());
             }
@@ -42,12 +49,6 @@ void WSHandler::ws_msg_handle(const std::string& message, bool is_binary, Applic
     } else {    
         // 接收到二进制数据时的回调
         // USER_LOG_INFO("Received binary message.");
-        // first time to receive binary message
-        if(app->get_first_audio_msg_received() == true) {
-            app->set_first_audio_msg_received(false);
-            app->eventQueue_.Enqueue(static_cast<int>(AppEvent::speaking_msg_received));
-        }
-
         BinProtocolInfo protocol_info;
         std::vector<uint8_t> opus_data;
         std::vector<int16_t> pcm_data;
@@ -57,8 +58,13 @@ void WSHandler::ws_msg_handle(const std::string& message, bool is_binary, Applic
             // 检查版本和类型是否符合预期
             if(protocol_info.version == app->get_ws_protocolVersion() && protocol_info.type == 0) {
                 // 将解码后的Opus数据放入队列供播放器使用
-                app->audio_processor_.decode(opus_data.data(), opus_data.size(), pcm_data);
-                app->audio_processor_.addFrameToPlaybackQueue(pcm_data);
+                if (app->audio_processor_.decode(opus_data.data(), opus_data.size(), pcm_data)) {
+                    if(app->get_first_audio_msg_received() == true) {
+                        app->set_first_audio_msg_received(false);
+                        app->eventQueue_.Enqueue(static_cast<int>(AppEvent::speaking_msg_received));
+                    }
+                    app->audio_processor_.addFrameToPlaybackQueue(pcm_data);
+                }
             } else {
                 USER_LOG_WARN("Received frame with unexpected version or type");
             }
@@ -80,26 +86,24 @@ void WSHandler::handle_vad_message(const Json::Value& root, Application* app) {
     }
 }
 
-// 处理 ASR 消息
-void WSHandler::handle_asr_message(const Json::Value& root, Application* app) {
-    const Json::Value text = root["text"];
-    if (text.isString()) {
-        std::string asr_text_ = text.asString();
-        USER_LOG_INFO("Received ASR text: %s", asr_text_.c_str());
-    } else {
-        USER_LOG_WARN("Invalid ASR text value.");
-    }
-    app->eventQueue_.Enqueue(static_cast<int>(AppEvent::asr_received));
-}
-
-// 处理 TTS 消息
-void WSHandler::handle_tts_message(const Json::Value& root, Application* app) {
+// 处理 GLM-4-Voice 会话消息
+void WSHandler::handle_voice_message(const Json::Value& root, Application* app) {
     const Json::Value state = root["state"];
     if (state.isString()) {
         std::string stateStr = state.asString();
-        if (stateStr == "end") {
-            USER_LOG_INFO("Received TTS end.");
-            app->set_tts_completed(true);
+        if (stateStr == "processing") {
+            USER_LOG_INFO("Voice input accepted; waiting for GLM-4-Voice.");
+            app->eventQueue_.Enqueue(static_cast<int>(AppEvent::voice_processing));
+        } else if (stateStr == "end") {
+            USER_LOG_INFO("Received voice response end.");
+            app->set_voice_completed(true);
+        } else if (stateStr == "text") {
+            const Json::Value text = root["text"];
+            if (text.isString()) {
+                USER_LOG_INFO("Voice response text: %s", text.asString().c_str());
+            }
+        } else if (stateStr == "no_speech") {
+            app->eventQueue_.Enqueue(static_cast<int>(AppEvent::vad_no_speech));
         }
     }
 }

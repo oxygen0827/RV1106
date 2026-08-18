@@ -1,6 +1,5 @@
 from service_manager import ServiceManager
 from tools.logger import logger
-from config.settings import global_settings
 from tools.registry import global_registry
 
 class TextHandler:
@@ -16,14 +15,9 @@ class TextHandler:
         if data.get('type') == 'hello':
             audio_params = data.get('audio_params', {})
             logger.info(f"Received hello message with audio params: {audio_params}")
-            api_key = data.get('api_key', None)
-            global_settings.Set_API_Key(api_key)
-            # 暂时没设定可变的音频参数列表, 所以client发送过来的音频参数不会被使用
-            # sample_rate = audio_params.get('sample_rate', AudioProcessor.sample_rate)
-            # channels = audio_params.get('channels', AudioProcessor.CHANNELS)
-            # frame_duration_ms = audio_params.get('frame_duration', AudioProcessor.frame_duration_ms)
-            # logger.info(f"Set audio parameters: sample_rate={sample_rate}, channels={channels}, frame_duration_ms={frame_duration_ms}")
-            # self.audio_processor.set_audio_params(sample_rate, channels, frame_duration_ms)
+            if data.get('api_key'):
+                logger.warning("Ignoring client-supplied API key; configure cloud credentials on the server")
+            logger.info("Voice protocol uses 16 kHz mono Opus with 40 ms frames")
 
         elif data.get('type') == 'functions_register':
             # 获取要注册的函数列表
@@ -42,9 +36,10 @@ class TextHandler:
             elif data.get('state') == 'listening':
                 self.service_manager.is_vad = False
                 self.service_manager.vad_service.reset()
-                self.service_manager.asr_service.reset()
-                # 提前打开tts流
-                self.service_manager.tts_service.tts_set(on_data=self.service_manager._tts_on_data, on_complete=self.service_manager._tts_on_complete)
+                self.service_manager.take_voice_audio()
+                if (self.service_manager.mode != 'asr' and
+                        not self.service_manager.prepare_voice_session()):
+                    logger.warning("GLM-4-Voice unavailable for this session")
 
             elif data.get('state') == 'thinking':
                 logger.info("Client is thinking")

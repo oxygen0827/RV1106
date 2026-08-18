@@ -154,12 +154,11 @@ static void _sys_para_init(void)
         strcpy(ui_system_para.location.city, "东城区");
         strcpy(ui_system_para.location.adcode, "110101");
         strcpy(ui_system_para.gaode_api_key, "your_amap_key");
-        strcpy(ui_system_para.aichat_app_info.addr, "172.32.0.100");
-        ui_system_para.aichat_app_info.port = 8765;
-        strcpy(ui_system_para.aichat_app_info.token, "123456");
+        ui_system_para.aichat_app_info.addr[0] = '\0';
+        ui_system_para.aichat_app_info.port = 8000;
+        ui_system_para.aichat_app_info.token[0] = '\0';
         strcpy(ui_system_para.aichat_app_info.device_id, "00:11:22:33:44:55");
-        strcpy(ui_system_para.aichat_app_info.aliyun_api_key, "your_aliyun_key");
-        ui_system_para.aichat_app_info.protocol_version = 1;
+        ui_system_para.aichat_app_info.protocol_version = 2;
         ui_system_para.aichat_app_info.sample_rate = 16000;
         ui_system_para.aichat_app_info.channels = 1;
         ui_system_para.aichat_app_info.frame_duration = 40;
@@ -231,7 +230,11 @@ static void _gpios_init(void)
 // 1s timer
 void _maintimer_cb(void)
 {
-    static uint16_t time_count2 = 299;
+    // Start the periodic persistence interval from zero.  Starting at 299
+    // writes the in-memory defaults back to system_para.conf on the first
+    // timer tick, which can overwrite externally provisioned AIChat values
+    // (including the full access token) before the ChatBot page connects.
+    static uint16_t time_count2 = 0;
     time_count2++;
     // 每秒闪烁一次LED
     if(time_count2 % 2 == 0)

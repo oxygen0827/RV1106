@@ -1,34 +1,39 @@
-from services.vad_service import VADService
-from services.asr_service import ASRService
-from services.chat_service import ChatService
-from services.tts_service import TTSService
-from tools.registry import global_registry
-from services.intent_service import IntentService
-from tools.audio_processor import AudioProcessor
-from threads.task_manager import TaskManager
-from tools.logger import logger
+import json
 import queue
 import threading
-import json
+
+from services.vad_service import VADService
+from services.asr_service import ASRService
+from services.voice_service import VoiceService
+from threads.task_manager import TaskManager
+from tools.audio_processor import AudioProcessor
+from tools.logger import logger
+from tools.registry import global_registry
+from config.settings import global_settings
+
 
 class ServiceManager:
+    """Own the per-client voice session and the WebSocket output queues."""
+
     def __init__(self):
-        # 初始化服务
         self.audio_processor = AudioProcessor()
+        self.mode = global_settings.mode if global_settings.mode in ("voice", "asr") else "voice"
         self.vad_service = VADService()
         self.asr_service = ASRService()
-        self.intent_service = IntentService(global_registry)
-        self.chat_service = ChatService()
-        self.tts_service = TTSService()
-        self.is_vad = False  # 防止VAD发生后还语音加入
+        self._session_lock = threading.RLock()
+        self._voice_service_factory = VoiceService
+        self.voice_service = None
+        self.is_vad = False
+        self.voice_audio_buffer = bytearray()
+        self.session_generation = 0
 
-        self.tts_text_queue = queue.Queue() # 用于存放 TTS 生成的文本
-        self.audio_queue = queue.Queue()    # 用于存放生成的音频数据
-        self.ws_send_queue = queue.Queue()  # 用于存储ws需要发送的数据
-
-        self.stop_event = threading.Event() # 用于控制线程停止
-
-        self.task_manager = TaskManager()   # 短生命周期的任务管理器
+        # audio_queue contains (session_generation, PCM bytes), followed by
+        # (session_generation, None) to serialize the voice end marker after
+        # every encoded Opus frame has entered ws_send_queue.
+        self.audio_queue = queue.Queue()
+        self.ws_send_queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.task_manager = TaskManager()
 
         def continue_chat():
             return "继续聊天..."
@@ -36,86 +41,184 @@ class ServiceManager:
         def handle_exit_intent():
             return "再见！"
 
-        # 默认的一些意图注册到系统
         global_registry.register_function("continue_chat", "继续聊天意图", {}, continue_chat)
         global_registry.register_function("exit_chat", "结束对话意图", {}, handle_exit_intent)
 
     def reset_services(self):
-        """
-        重置所有服务的状态
-        """
-        self.is_vad = False
+        """Invalidate outstanding cloud work and clear the old voice turn."""
+        with self._get_session_lock():
+            self.session_generation = getattr(self, "session_generation", 0) + 1
+            old_voice_service = getattr(self, "voice_service", None)
+            self.voice_service = None
+            self.is_vad = False
+            self.voice_audio_buffer.clear()
+
+        if old_voice_service:
+            try:
+                old_voice_service.reset()
+            except Exception:
+                pass
         self.vad_service.reset()
         self.asr_service.reset()
-        self.chat_service.chat_clear()
+        for pending_queue in (self.audio_queue, self.ws_send_queue):
+            self._drain_queue(pending_queue)
+
+    @staticmethod
+    def _drain_queue(pending_queue):
+        while True:
+            try:
+                pending_queue.get_nowait()
+            except queue.Empty:
+                return
+
+    def _get_session_lock(self):
+        lock = getattr(self, "_session_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._session_lock = lock
+        return lock
+
+    def prepare_voice_session(self):
+        """Create a clean multimodal conversation for the current listening turn."""
+        with self._get_session_lock():
+            session_generation = getattr(self, "session_generation", 0)
+            if getattr(self, "voice_service", None) is not None:
+                return True
+
         try:
-            self.tts_service.tts_close()
-        except Exception as e:
-            pass
+            voice_service = getattr(self, "_voice_service_factory", VoiceService)()
+        except Exception as exc:
+            logger.warning(f"GLM-4-Voice unavailable: {exc}")
+            return False
 
-    def _tts_on_data(self, data):
-        """
-        TTS 生成回调函数
-        :param data: 生成的音频数据
-        """
-        # 将生成的音频数据放入语音队列
-        self.audio_queue.put(data)
-        # logger.info(f"Received TTS data: {len(data)} bytes")
+        with self._get_session_lock():
+            if not self._is_current_session(session_generation):
+                return False
+            self.voice_service = voice_service
+        return True
 
-    def _tts_on_complete(self):
-        msg = {
-            "type": "tts",
-            "state": "end",
-        }
-        self.ws_send_queue.put(json.dumps(msg))
+    def append_voice_audio(self, pcm_data: bytes):
+        if pcm_data and not self.is_vad:
+            self.voice_audio_buffer.extend(pcm_data)
 
-    def chat_start_task(self, text):
-        """
-        处理识别到的文本，进行对话
-        :param self: ServiceManager 实例
-        :param text: 文本
-        """
-        # 1.进行意图识别
-        function_calls = self.intent_service.detect_intent(text)
-        history_list = []
-        # 2.执行函数调用（如果有）
-        for function_call in function_calls:
-            if "function_call" in function_call and "name" in function_call["function_call"]:
-                logger.info(f"[准备调用] {function_call}")
-                # 执行函数调用
-                if function_call["function_call"]["name"] == "continue_chat":
-                    # 继续聊天意图
-                    pass
-                elif function_call["function_call"]["name"] == "exit_chat":
-                    # 结束对话意图
-                    response =  {
-                            "type": "chat",
-                            "dialogue": "end"
-                    }
-                    self.ws_send_queue.put(json.dumps(response))
-                else:
-                    # 其他函数调用, 发送到Client端, Client自己处理
-                    self.ws_send_queue.put(json.dumps(function_call))
-                    history_list.append([
-                        {"role": "user", "content": f"函数调用: {function_call}"},
-                        {"role": "assistant", "content": f"函数调用完成"}
-                    ])
-        # 3.调用聊天服务生成文字
-        answers = self.chat_service.generate_chat_response(text, history=history_list, is_stream=True)
-        if answers == -1:
-            logger.error("LLM 生成失败")
+    def take_voice_audio(self) -> bytes:
+        audio_data = bytes(self.voice_audio_buffer)
+        self.voice_audio_buffer.clear()
+        return audio_data
+
+    def _is_current_session(self, session_generation):
+        return session_generation == getattr(self, "session_generation", 0)
+
+    def queue_ws_message(self, message, session_generation=None):
+        if session_generation is None:
+            self.ws_send_queue.put(message)
+            return True
+        if not self._is_current_session(session_generation):
+            return False
+        self.ws_send_queue.put((session_generation, message))
+        return True
+
+    def _queue_error(self, code, message, session_generation=None):
+        if session_generation is not None and not self._is_current_session(session_generation):
+            return
+        self.queue_ws_message(
+            json.dumps({"type": "error", "code": code, "message": message}),
+            session_generation,
+        )
+
+    def voice_start_task(self, pcm_data: bytes, session_generation=None):
+        """Call GLM-4-Voice for one VAD-delimited utterance."""
+        if session_generation is None:
+            session_generation = getattr(self, "session_generation", 0)
+        with self._get_session_lock():
+            if not self._is_current_session(session_generation):
+                logger.info("Discarding voice task from a closed session")
+                return -1
+            voice_service = self.voice_service
+
+        if voice_service is None:
+            self._queue_error(
+                "voice_unavailable",
+                "GLM-4-Voice is not configured",
+                session_generation,
+            )
             return -1
-        logger.info(f"[回复]: ")
-        # 4.将生成的文字放入 TTS任务队列
-        # for ans_chunk in answers:
-        #     print(ans_chunk, end="", flush=True)
-        #     service_manager.tts_text_queue.put(ans_chunk)
+        if not pcm_data:
+            self._queue_error(
+                "voice_unavailable",
+                "Voice input is empty",
+                session_generation,
+            )
+            return -1
 
-        # 4.直接TTS生成
-        for text_chunk in answers:
-            print(text_chunk, end="", flush=True)
-            # 调用 TTS 服务进行语音合成
-            self.tts_service.tts_speech_stream(text_chunk)
-        print()  # 换行
-        # 关闭 TTS 流
-        self.tts_service.tts_close()
+        try:
+            result = voice_service.generate_voice(pcm_data)
+        except Exception as exc:
+            logger.error(f"GLM-4-Voice generation failed: {exc}")
+            self._queue_error(
+                "voice_unavailable",
+                "Voice conversation failed",
+                session_generation,
+            )
+            return -1
+
+        if not self._is_current_session(session_generation):
+            logger.info("Discarding voice response from a closed session")
+            return -1
+        if not result.pcm16:
+            self._queue_error(
+                "voice_unavailable",
+                "GLM-4-Voice returned empty audio",
+                session_generation,
+            )
+            return -1
+
+        if result.text:
+            self.queue_ws_message(
+                json.dumps(
+                    {"type": "voice", "state": "text", "text": result.text},
+                    ensure_ascii=False,
+                ),
+                session_generation,
+            )
+        # The audio sender emits the end marker only after all PCM has been
+        # converted to individual 40 ms Opus packets.
+        self.audio_queue.put((session_generation, result.pcm16))
+        self.audio_queue.put((session_generation, None))
+        logger.info(
+            "GLM-4-Voice response queued: pcm_bytes=%d text=%s",
+            len(result.pcm16),
+            bool(result.text),
+        )
+        return None
+
+    def asr_start_task(self, pcm_data: bytes, session_generation=None):
+        """Transcribe one VAD-delimited utterance with GLM ASR."""
+        if session_generation is None:
+            session_generation = getattr(self, "session_generation", 0)
+        if not self._is_current_session(session_generation):
+            return -1
+        if not pcm_data:
+            self._queue_error("asr_empty", "Voice input is empty", session_generation)
+            return -1
+        try:
+            self.asr_service.asr_add_audio_buffer(pcm_data)
+            text = self.asr_service.asr_generate_text()
+        except Exception as exc:
+            logger.error("GLM ASR generation failed: %s", exc)
+            self._queue_error("asr_unavailable", "ASR request failed", session_generation)
+            return -1
+        if not self._is_current_session(session_generation):
+            return -1
+        if not text:
+            self._queue_error("asr_empty", "No speech recognized", session_generation)
+            return -1
+        self.queue_ws_message(
+            json.dumps({"type": "asr", "state": "text", "text": text}, ensure_ascii=False),
+            session_generation,
+        )
+        self.queue_ws_message(
+            json.dumps({"type": "asr", "state": "end"}), session_generation
+        )
+        logger.info("GLM ASR result: %s", text)
+        return None

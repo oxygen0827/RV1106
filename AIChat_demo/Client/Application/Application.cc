@@ -5,13 +5,16 @@
 
 WSHandler app_handler;
 
-Application::Application(const std::string& address, int port, const std::string& token, const std::string& deviceId, const std::string& aliyun_api_key, 
-                         int protocolVersion, int sample_rate, int channels, int frame_duration)
+Application::Application(const std::string& address, int port,
+                         const std::string& token,
+                         const std::string& deviceId, int protocolVersion,
+                         int sample_rate, int channels, int frame_duration,
+                         bool asr_mode)
     : ws_client_(address, port, token, deviceId, protocolVersion),
-      aliyun_api_key_(aliyun_api_key),
       ws_protocolVersion_(protocolVersion),
       client_state_(static_cast<int>(AppState::startup)),
-      audio_processor_(sample_rate, channels, frame_duration) {
+      audio_processor_(sample_rate, channels, frame_duration),
+      asr_mode_(asr_mode) {
         // 设置接收到消息的回调函数
         ws_client_.SetMessageCallback([this](const std::string& message, bool is_binary) {
             app_handler.ws_msg_handle(message, is_binary, this);

@@ -448,7 +448,7 @@ bool AudioProcess::decode(const uint8_t* opus_data, size_t opus_data_size, std::
         return false;
     }
 
-    int frame_size = 960;  // 40ms 帧, 16000Hz 采样率, 理论上应该是 640 个样本，但是 Opus 限制为 960
+    int frame_size = sample_rate / 1000 * frame_duration_ms;
     pcm_frame.resize(frame_size * channels);
 
     // 对当前帧进行解码

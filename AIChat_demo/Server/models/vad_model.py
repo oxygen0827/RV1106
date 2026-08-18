@@ -4,7 +4,7 @@ import os
 from tools.logger import logger
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
-_vad_path = os.path.join(current_dir, "./FunAudioLLM/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch")
+_vad_path = "fsmn-vad"
 
 class VADModel:
     def __init__(self, device="cpu", vad_model_path=_vad_path, frame_duration_ms=200, sample_rate=16000,
@@ -108,7 +108,7 @@ class VADModel:
 
         # 如果超过语音结束缓冲时间，返回语音结束
         if self.last_speech_pos > 0 and (audio_length - self.last_speech_pos) > self.post_speech_buffer_ms:
-            # 说话时长小于800ms, 则不进行ASR识别（可能是噪声）
+            # 说话时长小于800ms, 则不提交云端语音对话（可能是噪声）
             if self.last_speech_pos > 800:
                 logger.info("Speech ended, last speech position: %d ms", self.last_speech_pos)
                 return 1

@@ -9,10 +9,12 @@ enum class AppEvent {
     wake_detected,
     vad_no_speech,
     vad_end,
-    asr_received,
+    voice_processing,
     speaking_msg_received,
     speaking_end,
     dialogue_end,
+    asr_start,
+    asr_result,
     // Add more events here...
 };
 

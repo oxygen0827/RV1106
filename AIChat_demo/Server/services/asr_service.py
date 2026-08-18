@@ -19,7 +19,13 @@ class ASRService:
         # 将音频数据转换为numpy数组并添加到缓冲区
         self.asr_model.add_audio_buffer(audio_data)
 
-    def asr_generate_text(self):
+    def asr_take_audio_buffer(self):
+        """Detach the current session audio before a blocking cloud request."""
+        audio_buffer = self.asr_model.audio_buffer
+        self.asr_model.clear_audio_buffer()
+        return audio_buffer
+
+    def asr_generate_text(self, audio_buffer=None):
         """
         使用 ASR 模型进行语音识别，生成文本, 然后清空音频缓冲区
 
@@ -27,6 +33,6 @@ class ASRService:
                 - 如果识别成功，返回转录后的文本。
                 - 如果识别失败或没有检测到语音，返回 None。
         """
-        res = self.asr_model.ASR_generate_text(self.asr_model.audio_buffer.astype(np.float32))
-        self.asr_model.clear_audio_buffer()  # 清空音频缓冲区
-        return res
+        if audio_buffer is None:
+            audio_buffer = self.asr_take_audio_buffer()
+        return self.asr_model.ASR_generate_text(audio_buffer)

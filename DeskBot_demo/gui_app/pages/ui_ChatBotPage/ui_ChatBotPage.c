@@ -1,5 +1,6 @@
 #include "ui_ChatBotPage.h"
 #include "app_ChatBotPage.h"
+#include <stdio.h>
 
 ///////////////////// VARIABLES ////////////////////
 
@@ -13,10 +14,13 @@ lv_obj_t * ui_EyeLeft;
 lv_obj_t * ui_MouthPanel;
 lv_obj_t * ui_Mouth;
 lv_obj_t * ui_LabelInfo;
+lv_obj_t * ui_TranscriptPanel;
+lv_obj_t * ui_LabelTranscript;
 lv_timer_t * ui_ChatBot_timer;
 lv_timer_t * ui_ChatBot_move_timer;
 
 #define CHAT_BOT_UI_TEST 0
+#define CHAT_BOT_ASR_MODE 1
 
 struct ui_chat_para_t{
     bool first_enter;
@@ -233,7 +237,17 @@ static int ui_ai_chat_app_init(void)
 {
     if(!CHAT_BOT_UI_TEST) 
     {
-        int errno = start_ai_chat(ui_system_para.aichat_app_info.addr, ui_system_para.aichat_app_info.port, ui_system_para.aichat_app_info.token, ui_system_para.aichat_app_info.device_id, ui_system_para.aichat_app_info.aliyun_api_key, ui_system_para.aichat_app_info.protocol_version, ui_system_para.aichat_app_info.sample_rate, ui_system_para.aichat_app_info.channels, ui_system_para.aichat_app_info.frame_duration);
+        int errno = start_ai_chat(
+            ui_system_para.aichat_app_info.addr,
+            ui_system_para.aichat_app_info.port,
+            ui_system_para.aichat_app_info.token,
+            ui_system_para.aichat_app_info.device_id,
+            ui_system_para.aichat_app_info.protocol_version,
+            ui_system_para.aichat_app_info.sample_rate,
+            ui_system_para.aichat_app_info.channels,
+            ui_system_para.aichat_app_info.frame_duration,
+            CHAT_BOT_ASR_MODE
+        );
         if(errno)
         {
             // show msg box
@@ -254,6 +268,11 @@ static void _ChatBotTimer_cb(void)
         {
             lv_lib_pm_OpenPrePage(&page_manager);
         }
+    }
+
+    char transcript[512];
+    while (get_ai_chat_asr_text(transcript, sizeof(transcript))) {
+        lv_label_set_text_fmt(ui_LabelTranscript, "ASR: %s", transcript);
     }
     
     // 0-fault, 1-startup, 2-stop, 3-idle, 4-listening, 5-thinking, 6-speaking
@@ -449,6 +468,24 @@ void ui_ChatBotPage_init(void)
     lv_obj_set_style_text_opa(ui_LabelInfo, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_font(ui_LabelInfo, &lv_font_montserrat_20, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_add_flag(ui_LabelInfo, LV_OBJ_FLAG_HIDDEN);     /// Flags
+
+    ui_TranscriptPanel = lv_obj_create(ui_ChatBotPage);
+    lv_obj_set_size(ui_TranscriptPanel, 300, 70);
+    lv_obj_align(ui_TranscriptPanel, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_remove_flag(ui_TranscriptPanel, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_radius(ui_TranscriptPanel, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(ui_TranscriptPanel, lv_color_hex(0x102A43), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(ui_TranscriptPanel, 230, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_color(ui_TranscriptPanel, lv_color_hex(0x5BC0EB), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(ui_TranscriptPanel, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    ui_LabelTranscript = lv_label_create(ui_TranscriptPanel);
+    lv_obj_set_size(ui_LabelTranscript, 280, 54);
+    lv_obj_align(ui_LabelTranscript, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_long_mode(ui_LabelTranscript, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(ui_LabelTranscript, "ASR: waiting for speech");
+    lv_obj_set_style_text_color(ui_LabelTranscript, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_LabelTranscript, &ui_font_heiti22, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     lv_obj_add_event_cb(ui_ChatBotPage, ui_event_ChatBotPage, LV_EVENT_ALL, NULL);
 

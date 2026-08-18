@@ -21,7 +21,7 @@ void SpeakingState::Run(Application* app) {
     USER_LOG_INFO("Speaking state run.");
     while(state_running_.load() == true) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        if(app->get_tts_completed() && app->audio_processor_.playbackQueueIsEmpty()) {
+        if(app->get_voice_completed() && app->audio_processor_.playbackQueueIsEmpty()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             USER_LOG_INFO("Speaking end.");
             if(app->get_dialogue_completed() == false) {
@@ -29,7 +29,7 @@ void SpeakingState::Run(Application* app) {
             } else {
                 app->eventQueue_.Enqueue(static_cast<int>(AppEvent::dialogue_end));
             }
-            app->set_tts_completed(false);
+            app->set_voice_completed(false);
             app->set_dialogue_completed(false);
             break;
         }

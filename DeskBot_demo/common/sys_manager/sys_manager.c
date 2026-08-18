@@ -624,7 +624,6 @@ int sys_save_system_parameters(const char *filepath, const system_para_t *params
     fprintf(file, "AIChat_server_port=%d\n", params->aichat_app_info.port);
     fprintf(file, "AIChat_server_token=%s\n", params->aichat_app_info.token);
     fprintf(file, "AIChat_Client_ID=%s\n", params->aichat_app_info.device_id);
-    fprintf(file, "aliyun_api_key=%s\n", params->aichat_app_info.aliyun_api_key);
     fprintf(file, "AIChat_protocol_version=%d\n", params->aichat_app_info.protocol_version);
     fprintf(file, "AIChat_sample_rate=%d\n", params->aichat_app_info.sample_rate);
     fprintf(file, "AIChat_channels=%d\n", params->aichat_app_info.channels);
@@ -683,9 +682,6 @@ int sys_load_system_parameters(const char *filepath, system_para_t *params) {
         } else if(strcmp(key, "AIChat_Client_ID") == 0) {
             strncpy(params->aichat_app_info.device_id, value, sizeof(params->aichat_app_info.device_id)-1);
             params->aichat_app_info.device_id[sizeof(params->aichat_app_info.device_id)-1] = '\0';
-        } else if(strcmp(key, "aliyun_api_key") == 0) {
-            strncpy(params->aichat_app_info.aliyun_api_key, value, sizeof(params->aichat_app_info.aliyun_api_key)-1);
-            params->aichat_app_info.aliyun_api_key[sizeof(params->aichat_app_info.aliyun_api_key)-1] = '\0';
         } else if(strcmp(key, "AIChat_protocol_version") == 0) {
             params->aichat_app_info.protocol_version = atoi(value);
         } else if(strcmp(key, "AIChat_sample_rate") == 0) {

@@ -59,7 +59,7 @@ void IdleState::Exit(Application* app) {
         app->audio_processor_.addFrameToPlaybackQueue(frame);
         audioQueue.pop();
     }
-    app->set_tts_completed(true);
+    app->set_voice_completed(true);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     USER_LOG_INFO("Idle State exit.");
 }

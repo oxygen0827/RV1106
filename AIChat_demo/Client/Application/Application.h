@@ -14,9 +14,10 @@
 
 class Application {
 public:
-    Application(const std::string& address, int port, const std::string& token, const std::string& deviceId, 
-                const std::string& aliyun_api_key, int protocolVersion, 
-                int sample_rate, int channels, int frame_duration);
+    Application(const std::string& address, int port, const std::string& token,
+                const std::string& deviceId, int protocolVersion,
+                int sample_rate, int channels, int frame_duration,
+                bool asr_mode = false);
     ~Application();
 
     void Run();
@@ -29,6 +30,7 @@ public:
     StateMachine client_state_;
     EventQueue<int> eventQueue_;
     EventQueue<Json::Value> IntentQueue_;
+    EventQueue<std::string> TranscriptQueue_;
     // EventQueue<>;
     WebSocketClient ws_client_;
     IntentHandler intent_handler_;
@@ -40,11 +42,11 @@ public:
         return first_audio_msg_received_;
     }
 
-    void set_tts_completed(bool flag) {
-        tts_completed_ = flag;
+    void set_voice_completed(bool flag) {
+        voice_completed_ = flag;
     }
-    bool get_tts_completed() {
-        return tts_completed_;
+    bool get_voice_completed() {
+        return voice_completed_;
     }
 
     void set_dialogue_completed(bool flag) {
@@ -52,13 +54,6 @@ public:
     }
     bool get_dialogue_completed() {
         return dialogue_completed_;
-    }
-
-    void set_aliyun_api_key(const std::string& key) {
-        aliyun_api_key_ = key;
-    }
-    std::string get_aliyun_api_key() {
-        return aliyun_api_key_;
     }
 
     void set_threads_stop_sig(bool flag) {
@@ -78,13 +73,14 @@ public:
     int getState() {
         return client_state_.GetCurrentState();
     }
+    bool is_asr_mode() const { return asr_mode_; }
 
 private:
     bool first_audio_msg_received_ = false;
-    bool tts_completed_ = false;
+    bool voice_completed_ = false;
     bool dialogue_completed_ = false;
-    std::string aliyun_api_key_;
     int ws_protocolVersion_;
+    bool asr_mode_;
     // 原子变量用于通知线程退出
     std::atomic<bool> threads_stop_flag_ = false;
     std::thread ws_msg_thread_;

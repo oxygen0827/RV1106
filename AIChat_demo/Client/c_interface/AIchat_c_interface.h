@@ -1,6 +1,9 @@
 #ifndef AICHAT_C_INTERFACE_H
 #define AICHAT_C_INTERFACE_H
 
+#include <stdbool.h>
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -25,7 +28,10 @@ typedef enum {
 } ChatState;
 
 // 创建并初始化Application对象
-void* create_aichat_app(const char* address, int port, const char* token, const char* deviceId, const char* aliyun_api_key, int protocolVersion, int sample_rate, int channels, int frame_duration);
+void* create_aichat_app(const char* address, int port, const char* token,
+                        const char* deviceId, int protocolVersion,
+                        int sample_rate, int channels, int frame_duration,
+                        int asr_mode);
 
 // 运行Application对象
 void run_aichat_app(void* app_ptr);
@@ -41,6 +47,9 @@ ChatState get_aichat_app_state(void* app_ptr);
 
 // 获取 Intent 数据
 bool get_aichat_app_intent(void* app_ptr, IntentData* intent_data);
+
+// Copies the next ASR transcription into buffer and returns true when present.
+bool get_aichat_asr_text(void* app_ptr, char* buffer, size_t buffer_size);
 
 #ifdef __cplusplus
 }

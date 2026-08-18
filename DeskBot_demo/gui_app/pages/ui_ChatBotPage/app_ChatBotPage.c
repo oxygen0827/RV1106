@@ -20,9 +20,10 @@ void* ai_chat_thread_func(void* arg) {
     return NULL;
 }
 
-int start_ai_chat(const char* address, int port, const char* token, const char* deviceId, 
-                  const char* aliyun_api_key, int protocolVersion, int sample_rate, 
-                  int channels, int frame_duration) {
+int start_ai_chat(const char* address, int port, const char* token,
+                  const char* deviceId, int protocolVersion,
+                  int sample_rate, int channels, int frame_duration,
+                  int asr_mode) {
 
     // 如果应用已经在运行，返回错误
     if (is_running) {
@@ -31,8 +32,10 @@ int start_ai_chat(const char* address, int port, const char* token, const char* 
     }
 
     // 创建 Application 实例
-    app_instance = create_aichat_app(address, port, token, deviceId, aliyun_api_key,
-                                     protocolVersion, sample_rate, channels, frame_duration);
+    app_instance = create_aichat_app(
+        address, port, token, deviceId, protocolVersion,
+        sample_rate, channels, frame_duration, asr_mode
+    );
     if (!app_instance) {
         LV_LOG_ERROR("Error: Failed to create AI Chat application instance.\n");
         return -1;
@@ -69,6 +72,14 @@ int get_ai_chat_state(void) {
     }
     // 获取当前状态
     return get_aichat_app_state(app_instance);
+}
+
+bool get_ai_chat_asr_text(char* buffer, size_t buffer_size)
+{
+    if (!is_running || !app_instance) {
+        return false;
+    }
+    return get_aichat_asr_text(app_instance, buffer, buffer_size);
 }
 
 // 专门处理Intent，目前只有运动

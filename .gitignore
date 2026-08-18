@@ -1,3 +1,9 @@
 # *.o
 .vscode/
 
+# macOS metadata and local Python/runtime output
+._*
+__pycache__/
+*.py[cod]
+AIChat_demo/Server/logs/
+AIChat_demo/Server/test/logs/

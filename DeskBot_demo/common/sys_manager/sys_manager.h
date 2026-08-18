@@ -12,6 +12,8 @@ extern "C" {
 extern const char * sys_config_path;
 extern const char * city_adcode_path;
 
+#define AICHAT_ACCESS_TOKEN_MAX_LENGTH 64
+
 typedef struct {
     char city[36];
     char adcode[16]; // 'gao de' Amap adcode
@@ -20,9 +22,8 @@ typedef struct {
 typedef struct {
     char addr[40];
     int port;
-    char token[20];
+    char token[AICHAT_ACCESS_TOKEN_MAX_LENGTH + 1];
     char device_id[20];
-    char aliyun_api_key[128];       // 阿里百炼 api key for deepseek (need store)
     int protocol_version;
     int sample_rate;
     int channels;

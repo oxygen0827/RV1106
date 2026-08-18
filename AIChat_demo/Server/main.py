@@ -1,27 +1,36 @@
 import asyncio
 from ws_server import WebSocketServer
-from threads.tts_thread import TTSGenerateThread
 from threads.audio_send_thread import AudioSendThread
 from tools.logger import logger
 from service_manager import ServiceManager
+from config.settings import access_token_is_valid, global_settings
 import sys
 sys.path.append("..")
 
 async def main():
 
-    # 初始化vad asr chat intent tts服务
+    if not access_token_is_valid(global_settings.access_token):
+        raise RuntimeError(
+            "AICHAT_ACCESS_TOKEN must be 32-64 URL-safe characters"
+        )
+    if not global_settings.zhipu_api_key:
+        logger.warning("ZHIPU_API_KEY is not configured; cloud requests are disabled")
+
+    # 初始化 VAD 和 GLM-4-Voice 会话服务
     service_manager = ServiceManager()
 
-    # 启动 TTS 生成线程
-    tts_generate_thread = TTSGenerateThread(service_manager)
-    # tts_generate_thread.start()
-
-    # 启动 audio 数据发送线程
-    tts_send_thread = AudioSendThread(service_manager)
-    tts_send_thread.start()
+    # 启动语音响应音频发送线程
+    audio_send_thread = AudioSendThread(service_manager)
+    audio_send_thread.start()
 
     # 启动 WebSocket 服务器
-    server = WebSocketServer(host="0.0.0.0", port=8000, access_token="123456", service_manager=service_manager)
+    server = WebSocketServer(
+        host="0.0.0.0",
+        port=8000,
+        access_token=global_settings.access_token,
+        protocol_version=global_settings.protocol_version,
+        service_manager=service_manager,
+    )
     try:
         await server.start_server()
     except KeyboardInterrupt:
@@ -29,8 +38,7 @@ async def main():
     finally:
         # 停止线程
         service_manager.stop_event.set()  # 设置停止事件
-        # tts_generate_thread.join()
-        tts_send_thread.join()
+        audio_send_thread.join()
         logger.info("服务器已关闭。")
 
 if __name__ == "__main__":

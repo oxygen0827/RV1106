@@ -1,5 +1,6 @@
 #include "AIchat_c_interface.h"
 #include "../Application/Application.h"
+#include <cstring>
 #ifdef __arm__
 #include <json/json.h>
 #else
@@ -9,8 +10,14 @@
 extern "C" {
 
 // 创建并初始化Application对象
-void* create_aichat_app(const char* address, int port, const char* token, const char* deviceId, const char* aliyun_api_key, int protocolVersion, int sample_rate, int channels, int frame_duration) {
-    auto* app = new Application(std::string(address), port, std::string(token), std::string(deviceId), std::string(aliyun_api_key), protocolVersion, sample_rate, channels, frame_duration);
+void* create_aichat_app(const char* address, int port, const char* token,
+                        const char* deviceId, int protocolVersion,
+                        int sample_rate, int channels, int frame_duration,
+                        int asr_mode) {
+    auto* app = new Application(
+        std::string(address), port, std::string(token), std::string(deviceId),
+        protocolVersion, sample_rate, channels, frame_duration, asr_mode != 0
+    );
     return static_cast<void*>(app);
 }
 
@@ -102,6 +109,23 @@ bool get_aichat_app_intent(void* app_ptr, IntentData* intent_data) {
         intent_data->argument_count = 0;
     }
     return false; // 未提取到数据
+}
+
+bool get_aichat_asr_text(void* app_ptr, char* buffer, size_t buffer_size) {
+    if (!app_ptr || !buffer || buffer_size == 0) {
+        return false;
+    }
+    auto* app = static_cast<Application*>(app_ptr);
+    if (app->TranscriptQueue_.IsEmpty()) {
+        return false;
+    }
+    auto text_opt = app->TranscriptQueue_.Dequeue();
+    if (!text_opt.has_value()) {
+        return false;
+    }
+    std::strncpy(buffer, text_opt->c_str(), buffer_size - 1);
+    buffer[buffer_size - 1] = '\0';
+    return true;
 }
 
 

@@ -40,9 +40,11 @@ void StateConfig::Configure(StateMachine& state_machine, Application* app) {
 
     // 添加状态切换
     state_machine.RegisterTransition(static_cast<int>(AppState::startup), static_cast<int>(AppEvent::startup_done), static_cast<int>(AppState::idle));
+    state_machine.RegisterTransition(static_cast<int>(AppState::startup), static_cast<int>(AppEvent::asr_start), static_cast<int>(AppState::listening));
     state_machine.RegisterTransition(static_cast<int>(AppState::idle), static_cast<int>(AppEvent::wake_detected), static_cast<int>(AppState::speaking));
     state_machine.RegisterTransition(static_cast<int>(AppState::listening), static_cast<int>(AppEvent::vad_no_speech), static_cast<int>(AppState::idle));
-    state_machine.RegisterTransition(static_cast<int>(AppState::listening), static_cast<int>(AppEvent::asr_received), static_cast<int>(AppState::thinking));
+    state_machine.RegisterTransition(static_cast<int>(AppState::listening), static_cast<int>(AppEvent::voice_processing), static_cast<int>(AppState::thinking));
+    state_machine.RegisterTransition(static_cast<int>(AppState::listening), static_cast<int>(AppEvent::asr_result), static_cast<int>(AppState::idle));
     state_machine.RegisterTransition(static_cast<int>(AppState::thinking), static_cast<int>(AppEvent::speaking_msg_received), static_cast<int>(AppState::speaking)); 
     state_machine.RegisterTransition(static_cast<int>(AppState::speaking), static_cast<int>(AppEvent::speaking_end), static_cast<int>(AppState::listening));
     state_machine.RegisterTransition(static_cast<int>(AppState::speaking), static_cast<int>(AppEvent::dialogue_end), static_cast<int>(AppState::idle));

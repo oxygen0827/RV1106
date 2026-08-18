@@ -1,5 +1,4 @@
 from concurrent.futures import ThreadPoolExecutor
-from services.chat_service import ChatService
 from tools.logger import logger
 
 # 短生命周期的任务管理器

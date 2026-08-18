@@ -22,7 +22,6 @@ void StartupState::Enter(Application* app) {
         std::string json_message = 
         R"({
             "type": "hello",
-            "api_key": ")" + app->get_aliyun_api_key() + R"(",
             "audio_params": {
                 "format": "opus",
                 "sample_rate": )" + std::to_string(app->audio_processor_.get_sample_rate()) + R"(,
@@ -30,6 +29,9 @@ void StartupState::Enter(Application* app) {
                 "frame_duration": )" + std::to_string(app->audio_processor_.get_frame_duration()) + R"(
             }
         })";
+        if (app->is_asr_mode()) {
+            json_message.insert(json_message.size() - 1, ",\"mode\":\"asr\"");
+        }
         app->ws_client_.SendText(json_message);
         // 注册意图处理函数
         // 注册所有函数到 IntentHandler
@@ -40,7 +42,7 @@ void StartupState::Enter(Application* app) {
         std::string serialized_message = Json::writeString(writer, register_message);
         app->ws_client_.SendText(serialized_message);
         // start up done
-        app->eventQueue_.Enqueue(static_cast<int>(AppEvent::startup_done));
+        app->eventQueue_.Enqueue(static_cast<int>(app->is_asr_mode() ? AppEvent::asr_start : AppEvent::startup_done));
         USER_LOG_INFO("Startup done.");
     }
     else {

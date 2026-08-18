@@ -82,6 +82,11 @@ chmod +x ./bin/AIChatClient
 ./bin/AIChatClient 172.32.0.100 8000 123456
 ```
 
+ASR 测试模式（服务端需设置 `AICHAT_MODE=asr`）：
+```sh
+./bin/AIChatClient 172.32.0.100 8000 123456 asr
+```
+
 #### 3. 清除:
 
 ```sh
@@ -130,9 +135,9 @@ make clean-all
    ```cpp
    struct BinProtocol {
        uint16_t version;       //协议版本
-       uint16_t type;          //0为音频数据
+       uint16_t type;          //0为音频数据（上行和下行均使用此类型，方向由WebSocket方向决定）
        uint32_t payload_size;  //音频数据长度
-       uint8_t payload[];      //opus音频数据
+       uint8_t payload[];      //16 kHz、单声道、40 ms Opus音频数据
    } __attribute__((packed));
    ```
 
@@ -160,6 +165,8 @@ make clean-all
     ]
 }
 ```
+
+当前服务端使用智谱 `GLM-4-Voice` 直接进行语音理解和语音生成。Client 不发送或接收 WAV；上行录音和下行播放都保持 16 kHz、单声道、16-bit PCM 经 Opus 编码的二进制帧。服务端在收到 VAD 结束事件后将上行 PCM 封装为 WAV 调用云端，再将云端返回的 WAV 重采样为 16 kHz PCM 后重新编码为 Opus。
 
 6. 可能接收到的意图
 
