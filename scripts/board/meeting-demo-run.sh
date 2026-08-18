@@ -9,10 +9,12 @@ MODE=${MODE:-listen}
 CAFILE=${CAFILE:-/root/bin/cacert.pem}
 EXTRA_ARGS=${EXTRA_ARGS:-}
 
-# 麦克风：单端模式 + 数字音量 185（0.5dB/步，-12dBFS 附近，大声不削波）
+# 麦克风：单端模式 + 数字音量 235（0.5dB/步≈+20dB）。
+# 板载麦灵敏度低，185 时 1 米外语音峰值仅 -19dBFS，ASR 无法识别；
+# 235 时峰值 -6dBFS 不削波，远近说话都能识别。
 amixer -c 0 cset numid=19 1 >/dev/null 2>&1 || true
-amixer -c 0 cset numid=6 185 >/dev/null 2>&1 || true
-amixer -c 0 cset numid=7 185 >/dev/null 2>&1 || true
+amixer -c 0 cset numid=6 235 >/dev/null 2>&1 || true
+amixer -c 0 cset numid=7 235 >/dev/null 2>&1 || true
 # 喇叭：DAC LINEOUT 音量（0-30，15 适中）
 amixer -c 0 cset numid=24 15 >/dev/null 2>&1 || true
 

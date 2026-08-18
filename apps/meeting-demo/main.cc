@@ -42,6 +42,7 @@
 #include "audio.h"
 #include "http_client.h"
 #include "util.h"
+#include "vad_policy.h"
 #include "wss_transport.h"
 
 static std::atomic<bool> g_quit{false};
@@ -418,17 +419,15 @@ int main(int argc, char** argv) {
                          m.get("text", "").asString().c_str());
                 }
             };
-            // 没有跨连接 PCM 缓冲时，自动重连会永久丢掉断线期间的语音，
-            // 却仍让 UI 显示“记录中”。立即结束并拒绝保存才符合完整性契约。
             wst.on_close = [&, name](int code, const std::string& reason) {
                 if (g_quit.load()) return;
                 if (code == 4004) {
                     LOGF("[%s] session 已结束，不再重连", name);
+                    g_quit.store(true);
                     return;
                 }
-                LOGF("[纪要失败] %s 断线 (%d %s)，本场语音可能不完整",
+                LOGF("[连接中断] %s 断线 (%d %s)，已排队音频会保留并自动重连",
                      name, code, reason.c_str());
-                g_quit.store(true);
             };
             return;
         }
@@ -527,7 +526,8 @@ int main(int argc, char** argv) {
     // final line (for example after a broken upstream path).
     std::atomic<int> speech_frames_seen{0};
     // 采集/注入共用的帧回调
-    // VAD 状态：前视环（最近 8 帧 / 800ms）+ 拖尾（有声后延续 3s）
+    // VAD 状态：前视环（最近 8 帧 / 800ms）+ 拖尾（有声后延续 3s）。
+    // 自适应模式前 5s 只学习板上真实底噪，不把启动瞬态上传为语音。
     struct VadState {
         std::vector<int16_t> ring[8];
         int ring_fill = 0, ring_head = 0;
@@ -543,24 +543,31 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < n; i++) sum += (double)pcm[i] * pcm[i];
             int rms = (int)std::sqrt(sum / n);
             // 自适应阈值：静音帧 EMA 估计噪声底，阈值 = max(140, 2.5×底)
-            static double noise_floor = 100.0;
-            int thr = vad_threshold;
-            if (thr <= 0) {
-                bool loud = (rms > noise_floor * 2.5 && rms > 140);
-                if (!loud) noise_floor = 0.9 * noise_floor + 0.1 * rms;
-                thr = (int)std::max(140.0, 2.5 * noise_floor);
+            static AdaptiveVadGate vad_gate(vad_threshold, 50);
+            VadDecision vd = vad_gate.process(rms);
+            int thr = vd.threshold;
+            bool voice = vd.voice;
+            static bool calibration_logged = false;
+            if (vd.calibrating && !calibration_logged) {
+                calibration_logged = true;
+                LOGF("VAD: 正在校准底噪（前 5 秒不上传语音）...");
             }
-            bool voice = (rms >= thr);
+            if (!vd.calibrating && calibration_logged && vad_gate.noise_floor() >= 0) {
+                calibration_logged = false;
+                LOGF("VAD: 底噪校准完成 (floor=%.0f thr=%d)",
+                     vad_gate.noise_floor(), thr);
+            }
             if (voice) speech_frames_seen.fetch_add(1);
             if (debug_log && (seq % 100 == 0 || voice))
-                LOGF("rms=%d thr=%d floor=%.0f voice=%d", rms, thr, noise_floor, voice ? 1 : 0);
+                LOGF("rms=%d thr=%d floor=%.0f voice=%d",
+                     rms, thr, vad_gate.noise_floor(), voice ? 1 : 0);
 
             auto send_tr = [&](const int16_t* p, size_t len) {
                 if (use_transcribe && !uplink_paused() &&
                     !ws_tr->send_binary(reinterpret_cast<const uint8_t*>(p),
                                         len * sizeof(int16_t))) {
                     if (!g_quit.exchange(true))
-                        LOGF("[纪要失败] 音频上行队列已满或连接已断开");
+                        LOGF("[纪要失败] 音频上行发送失败（队列溢出或底层写错误）");
                 }
             };
 
@@ -604,12 +611,15 @@ int main(int argc, char** argv) {
                     send_tr(pcm, n);
                 }
                 // 静音保活：无语音时每 1s 发一帧，防止服务端空闲断开
+                // 服务端已有协议层 Ping；这里只保留很低的 ASR 侧活动量。
                 static auto last_silence = std::chrono::steady_clock::now();
                 if (!voice && !vad.in_speech) {
                     auto now = std::chrono::steady_clock::now();
-                    if (now - last_silence >= std::chrono::seconds(1)) {
+                    if (ws_tr->is_open() &&
+                        now - last_silence >= std::chrono::seconds(5)) {
                         last_silence = now;
-                        send_tr(pcm, n);
+                        static std::vector<int16_t> keepalive(320, 0);  // 20ms
+                        send_tr(keepalive.data(), keepalive.size());
                     }
                 }
             }
@@ -779,7 +789,18 @@ int main(int argc, char** argv) {
     if (understanding_thread.joinable()) understanding_thread.join();
     bool uplink_flush_ok = true;
     if (use_transcribe) {
-        if (!ws_tr->is_open()) {
+        // 弱网会在结束时自动重连；先等短暂恢复窗口，而不是把可恢复的
+        // 1011 直接判成音频丢失。重连期间应用队列会保留已采集 PCM。
+        bool connected = ws_tr->is_open();
+        if (!connected) {
+            for (int i = 0; i < 200 && !connected; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                connected = ws_tr->is_open();
+            }
+            if (connected)
+                LOGF("[连接恢复] transcribe 已重连，继续排空尾部音频");
+        }
+        if (!connected) {
             uplink_flush_ok = false;
         } else {
             Json::Value m;

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+TEST_BIN="${TMPDIR:-/tmp}/meeting-vad-policy-test"
+
+"${CXX:-c++}" -std=c++11 -Wall -Wextra -Werror \
+  -I"${PROJECT_DIR}/apps/meeting-demo" \
+  "${PROJECT_DIR}/apps/meeting-demo/tests/vad-policy-test.cc" \
+  -o "${TEST_BIN}"
+"${TEST_BIN}"

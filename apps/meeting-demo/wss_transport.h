@@ -109,6 +109,8 @@ public:
         remote_close_code_.store(0);
         send_failed_.store(false);
         queue_overflow_reported_.store(false);
+        current_url_ = url;
+        current_cafile_ = cafile;
         pump_scheduled_.store(false);
 
         websocketpp::lib::error_code ec;
@@ -136,9 +138,25 @@ public:
         conn->set_open_handler([this](Hdl hdl) {
             (void)hdl;
             open_.store(true);
+            // 重连成功后队列里可能还有断线期间入队的帧，pump 已在
+            // 断线时退出（pump_scheduled_=false），这里必须重新启动。
+            bool schedule = false;
+            {
+                std::lock_guard<std::mutex> lk(q_mutex_);
+                if (!out_queue_.empty() && !pump_scheduled_.exchange(true))
+                    schedule = true;
+            }
             queue_cv_.notify_all();
             LOGF("ws connected");
+            if (schedule) client_.get_io_service().post([this]() { pump_once(); });
             if (on_open) on_open();
+        });
+
+        // Do not put application PCM ahead of a server Ping: a queued 100ms
+        // frame on RTL8723BS can be worth several seconds of uplink time.
+        conn->set_ping_handler([this](Hdl, std::string) {
+            if (!stopping_.load()) begin_pong_pause();
+            return true;
         });
 
         conn->set_fail_handler([this](Hdl hdl) {
@@ -146,6 +164,7 @@ public:
             auto c = client_.get_con_from_hdl(hdl);
             std::string err = c ? c->get_ec().message() : "unknown";
             LOGF("ws handshake failed: %s", err.c_str());
+            if (!intentional_close_.load()) schedule_reconnect();
             if (on_fail) on_fail(err);
         });
 
@@ -159,6 +178,8 @@ public:
             queue_cv_.notify_all();
             LOGF("ws closed code=%d reason=%s", code, reason.c_str());
             if (on_close) on_close(code, reason);
+            if (!intentional_close_.load() && !stopping_.load())
+                schedule_reconnect();
         });
 
         client_.connect(conn);
@@ -166,7 +187,9 @@ public:
     }
 
     bool send_json(const Json::Value& v) override {
-        if (!open_.load() || send_failed_.load()) {
+        // 允许在重连窗口内入队：弱网 1011 后连接会短暂断开，
+        // 此时返回 false 会被上层当成致命错误，而队列本可骑过这次重连。
+        if (send_failed_.load() || stopping_.load()) {
             send_failed_.store(true);
             return false;
         }
@@ -176,7 +199,7 @@ public:
     }
 
     bool send_binary(const uint8_t* data, size_t len) override {
-        if (!open_.load() || send_failed_.load()) {
+        if (send_failed_.load() || stopping_.load()) {
             send_failed_.store(true);
             return false;
         }
@@ -201,6 +224,7 @@ public:
     bool is_open() const override { return open_.load(); }
 
     void close() override {
+        intentional_close_.store(true);
         websocketpp::lib::error_code ec;
         if (open_.load()) client_.close(hdl_, websocketpp::close::status::normal, "", ec);
     }
@@ -225,12 +249,45 @@ public:
     }
 
 private:
-    // 所有发送均在 io 线程串行执行。每轮只允许 websocketpp 保留一个
-    // 待发送帧，因此自动 Pong 最多排在一个 3200B PCM 帧之后。
+    // 所有发送均在 io 线程串行执行。Ping 到达后暂停新的 PCM 入队，自动
+    // Pong 只会排在极少待发数据后。
     struct OutFrame {
         bool text;
         std::string data;
     };
+    struct QueuedFrame {
+        int bytes = 0;
+        OutFrame frame;
+    };
+    QueuedFrame make_queued_frame(OutFrame frame) {
+        QueuedFrame queued;
+        queued.bytes = static_cast<int>(frame.data.size());
+        queued.frame = std::move(frame);
+        return queued;
+    }
+
+    void begin_pong_pause() {
+        pong_pause_until_ = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(700);
+    }
+
+    bool pong_pause_active() const {
+        return std::chrono::steady_clock::now() < pong_pause_until_;
+    }
+
+    void schedule_reconnect() {
+        if (!running_.load() || intentional_close_.load() || stopping_.load()) return;
+        if (reconnect_scheduled_.exchange(true)) return;
+        client_.set_timer(1000, [this](const websocketpp::lib::error_code& ec) {
+            if (ec || stopping_.load() || intentional_close_.load()) {
+                reconnect_scheduled_.store(false);
+                return;
+            }
+            reconnect_scheduled_.store(false);
+            LOGF("ws reconnecting");
+            connect(current_url_, current_cafile_);
+        });
+    }
 
     bool enqueue(OutFrame frame) {
         bool schedule = false;
@@ -240,12 +297,14 @@ private:
                 if (!queue_overflow_reported_.exchange(true))
                     LOGF("ws audio queue overflow (%zuB); meeting is incomplete",
                          out_queue_bytes_);
+                // 溢出即纪要不再完整；无论当前是否在线都标记失败，
+                // 让结束流程如实上报而不是悄悄丢帧后自称完整。
                 send_failed_.store(true);
                 return false;
             }
             out_queue_bytes_ += frame.data.size();
-            out_queue_.push_back(std::move(frame));
-            if (!pump_scheduled_.exchange(true)) schedule = true;
+            out_queue_.push_back(make_queued_frame(std::move(frame)));
+            if (open_.load() && !pump_scheduled_.exchange(true)) schedule = true;
         }
         queue_cv_.notify_all();
         if (schedule) client_.get_io_service().post([this]() { pump_once(); });
@@ -273,7 +332,7 @@ private:
 
         {
             std::lock_guard<std::mutex> lk(q_mutex_);
-            if (out_queue_.empty()) {
+            if (out_queue_.empty() || (!open_.load() && !intentional_close_.load())) {
                 pump_scheduled_.store(false);
                 queue_cv_.notify_all();
                 return;
@@ -283,11 +342,11 @@ private:
         websocketpp::lib::error_code ec;
         auto conn = client_.get_con_from_hdl(hdl_, ec);
         if (ec || !conn) {
-            fail_pump(ec ? ec.message() : "connection unavailable");
+            pump_scheduled_.store(false);
             return;
         }
         if (conn->get_state() != websocketpp::session::state::open) {
-            fail_pump("connection is not open");
+            pump_scheduled_.store(false);
             return;
         }
         int kernel_pending = 0;
@@ -301,6 +360,11 @@ private:
             return;
         }
 
+        if (pong_pause_active()) {
+            schedule_pump_retry();
+            return;
+        }
+
         OutFrame frame;
         {
             std::lock_guard<std::mutex> lk(q_mutex_);
@@ -309,8 +373,9 @@ private:
                 queue_cv_.notify_all();
                 return;
             }
-            frame = std::move(out_queue_.front());
-            out_queue_bytes_ -= frame.data.size();
+            QueuedFrame queued = std::move(out_queue_.front());
+            frame = std::move(queued.frame);
+            out_queue_bytes_ -= queued.bytes;
             out_queue_.pop_front();
         }
 
@@ -334,7 +399,7 @@ private:
     std::thread io_thread_;
     std::mutex q_mutex_;
     std::condition_variable queue_cv_;
-    std::deque<OutFrame> out_queue_;
+    std::deque<QueuedFrame> out_queue_;
     size_t out_queue_bytes_ = 0;
     boost::asio::io_service::work* work_ = nullptr;
     Hdl hdl_;
@@ -345,6 +410,11 @@ private:
     std::atomic<int> remote_close_code_{0};
     std::atomic<bool> send_failed_{false};
     std::atomic<bool> queue_overflow_reported_{false};
+    std::atomic<bool> intentional_close_{false};
+    std::atomic<bool> reconnect_scheduled_{false};
+    std::chrono::steady_clock::time_point pong_pause_until_{};
+    std::string current_url_;
+    std::string current_cafile_;
 };
 
 // 工厂：按 URL scheme 选择明文/TLS 实现
