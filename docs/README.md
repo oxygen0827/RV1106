@@ -4,6 +4,8 @@
 - [会议纪要应用与 DeskBot 页面](../apps/meeting-demo/README.md)
 - [硬件参考](hardware-reference.md)
 - [首次上板与恢复](board-bringup.md)
+- [板子使用说明（算法工程师版）](board-usage-guide.md)
+- [第二块板验收记录](../captures/bringup-20260815/README.md)
 - [摄像头与 YOLO 上板验收](camera-yolo.md)
 - [软件架构与 AI 开发方法](software-architecture-and-vibecoding.md)
 - [Docker 开发环境](docker-development.md)

@@ -62,6 +62,7 @@ SDK 初始化固定上游提交 `b7a9f31e2d1e4407b89e0bfe5db0ad78678b96a9`，默
 RV1106/
 ├── docs/                    # 提炼后的开发文档
 ├── apps/                    # 会议应用、DeskBot 集成、静态/实时 YOLO
+├── captures/                # 已整理的板级验收证据
 ├── docker/                  # Ubuntu 22.04 amd64 构建镜像
 ├── reference/echo-mate/     # 官方附件和关键 README 快照
 ├── scripts/                 # SDK 管理、构建、部署和诊断入口

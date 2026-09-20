@@ -1,0 +1,19 @@
+bssid=50:fe:39:e6:47:92
+freq=2437
+ssid=LDKJ
+id=0
+mode=station
+pairwise_cipher=CCMP
+group_cipher=CCMP
+key_mgmt=WPA2-PSK
+wpa_state=COMPLETED
+ip_address=192.168.31.254
+address=04:4a:69:fe:48:bc
+---
+    inet 192.168.31.254/24 brd 192.168.31.255 scope global wlan0
+---
+default via 192.168.31.1 dev wlan0
+172.32.0.0/16 dev usb0 scope link  src 172.32.0.93
+192.168.31.0/24 dev wlan0 scope link  src 192.168.31.254
+---
+nameserver 192.168.31.1 # wlan0

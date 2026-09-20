@@ -23,3 +23,6 @@ __pycache__/
 *.py[cod]
 *.o
 *.a
+
+# frp 客户端工具（二进制不入库）
+.tools/

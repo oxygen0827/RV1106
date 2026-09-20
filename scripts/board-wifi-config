@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# board-wifi-config - 安全配置板子 Wi-Fi（密码不回显）
+#
+# 用法: scripts/board-wifi-config [ADB_SERIAL]
+#
+# 密码来源: 私密 env 文件（默认 ~/.echo-mate-env），键:
+#   WIFI_SSID=<ssid>
+#   WIFI_PSK=<password>
+# 文件权限必须为 600。密码只出现在本地临时文件（600，用完即删）与板端
+# /etc/wpa_supplicant.conf（600），不出现在命令行参数/ps/日志中。
+#
+# 流程: 生成本地临时 conf -> adb push -> 板端 chmod 600 -> 启 wlan0 ->
+#       setsid 起 wpa_supplicant -> wpa_cli 等 COMPLETED -> udhcpc 取 IP ->
+#       验证网关可达。
+set -euo pipefail
+
+ENV_FILE=${ENV_FILE:-$HOME/.echo-mate-env}
+ADB_SERIAL=${1:-}
+ADB=(adb)
+[[ -n "$ADB_SERIAL" ]] && ADB=(adb -s "$ADB_SERIAL")
+
+say() { printf '[wifi-config] %s\n' "$*"; }
+die() { printf '[wifi-config] ERROR: %s\n' "$*" >&2; exit 1; }
+
+[[ -f "$ENV_FILE" ]] || die "env file not found: $ENV_FILE (create with WIFI_SSID/WIFI_PSK, chmod 600)"
+mode=$(stat -f '%Lp' "$ENV_FILE" 2>/dev/null || stat -c '%a' "$ENV_FILE" 2>/dev/null)
+[[ "$mode" == "600" ]] || die "env file must be chmod 600 (got $mode)"
+
+# 从私密文件读取（不 export，避免泄漏到子进程环境）
+WIFI_SSID=$(grep -E '^WIFI_SSID=' "$ENV_FILE" | head -1 | cut -d= -f2- | tr -d '"' || true)
+WIFI_PSK=$(grep -E '^WIFI_PSK=' "$ENV_FILE" | head -1 | cut -d= -f2- | tr -d '"' || true)
+[[ -n "$WIFI_SSID" ]] || die "WIFI_SSID missing in $ENV_FILE"
+[[ -n "$WIFI_PSK" ]] || die "WIFI_PSK missing in $ENV_FILE"
+say "target SSID: $WIFI_SSID (password not shown)"
+
+"${ADB[@]}" get-state >/dev/null 2>&1 || die "ADB device not connected"
+
+# 生成本地临时配置（600），push 到板子后删除
+TMP_CONF=$(mktemp "${TMPDIR:-/tmp}/wpa_supplicant.XXXXXX")
+chmod 600 "$TMP_CONF"
+cat > "$TMP_CONF" <<EOF
+ctrl_interface=/var/run/wpa_supplicant
+update_config=1
+country=CN
+
+network={
+    ssid="$WIFI_SSID"
+    psk="$WIFI_PSK"
+    key_mgmt=WPA-PSK
+}
+EOF
+say "pushing wpa_supplicant.conf ($(wc -c < "$TMP_CONF") bytes)"
+"${ADB[@]}" push "$TMP_CONF" /etc/wpa_supplicant.conf >/dev/null
+rm -f "$TMP_CONF"
+"${ADB[@]}" shell 'chmod 600 /etc/wpa_supplicant.conf; ls -l /etc/wpa_supplicant.conf' | tr -d '\r'
+
+say "bringing up wlan0 and starting wpa_supplicant"
+"${ADB[@]}" shell 'killall wpa_supplicant 2>/dev/null; ip link set wlan0 up; sleep 1; mkdir -p /var/run/wpa_supplicant; setsid wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf </dev/null >/dev/null 2>&1; sleep 2; pgrep wpa_supplicant >/dev/null && echo wpa_supplicant-running || echo wpa_supplicant-missing' | tr -d '\r'
+
+say "waiting for WPA authentication (up to 30s)"
+state=""
+for i in $(seq 1 30); do
+  state=$("${ADB[@]}" shell 'wpa_cli -i wlan0 status 2>/dev/null' | awk -F= '/wpa_state=/{print $2}' | tr -d '\r')
+  [[ "$state" == "COMPLETED" ]] && break
+  sleep 1
+done
+if [[ "$state" != "COMPLETED" ]]; then
+  say "wpa_state=$state (not COMPLETED); last kernel wifi log:"
+  "${ADB[@]}" shell 'dmesg | grep -iE "wlan|r8723|wpa" | tail -6' || true
+  die "authentication failed. Check SSID/PSK in $ENV_FILE"
+fi
+say "wpa_state=COMPLETED"
+"${ADB[@]}" shell 'wpa_cli -i wlan0 status' | grep -E "ssid|key_mgmt" | sed 's/psk=.*/psk=***/' | tr -d '\r'
+
+say "requesting DHCP lease"
+"${ADB[@]}" shell 'killall udhcpc 2>/dev/null; udhcpc -i wlan0 -t 10 -q' >/dev/null 2>&1 || true
+sleep 2
+ip=$("${ADB[@]}" shell 'ip -4 addr show wlan0' | awk '/inet /{print $2}' | cut -d/ -f1 | tr -d '\r')
+[[ -n "$ip" ]] || die "no IPv4 address after DHCP"
+say "wlan0 IPv4: $ip"
+
+gateway=$("${ADB[@]}" shell 'ip route' | awk '/default/{print $3; exit}' | tr -d '\r')
+if [[ -n "$gateway" ]]; then
+  say "pinging gateway $gateway"
+  "${ADB[@]}" shell "ping -c 3 -W 2 $gateway" | tail -2 | tr -d '\r'
+else
+  say "WARN: no default route yet"
+fi
+
+say "done: SSID=$WIFI_SSID IP=$ip"
