@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""NV12 裸帧 → PNG（纯 Python，仅用标准库 zlib/struct）。
+
+用于快速目检板端 camera_yolo / rkisp_demo dump 的 ISP 输出帧。
+支持两种输入:
+  1. 单帧 NV12 文件: nv12-to-png in.nv12 out.png --width 1280 --height 720
+  2. 连续多帧文件(每帧 W*H*3/2 字节): 自动按帧数切分, 输出 out-<i>.png
+
+若像素全为 0 会打印警告（ISP 通路未出数据）。
+"""
+import struct
+import sys
+import zlib
+from pathlib import Path
+
+
+def yuv_to_rgb(y, u, v):
+    c = y - 16
+    d = u - 128
+    e = v - 128
+    r = max(0, min(255, int((298 * c + 409 * e + 128) >> 8)))
+    g = max(0, min(255, int((298 * c - 100 * d - 208 * e + 128) >> 8)))
+    b = max(0, min(255, int((298 * c + 516 * d + 128) >> 8)))
+    return r, g, b
+
+
+def nv12_to_rgb(data, w, h):
+    """NV12 (Y plane + interleaved UV) -> list of RGB rows."""
+    y_size = w * h
+    y_plane = data[:y_size]
+    uv_plane = data[y_size:]
+    rows = []
+    nonzero = 0
+    for j in range(h):
+        row = bytearray()
+        for i in range(w):
+            y = y_plane[j * w + i]
+            uv_idx = ((j // 2) * (w // 2) + i // 2) * 2
+            u = uv_plane[uv_idx]
+            v = uv_plane[uv_idx + 1]
+            if y or u or v:
+                nonzero += 1
+            row.extend(yuv_to_rgb(y, u, v))
+        rows.append(bytes(row))
+    return rows, nonzero
+
+
+def write_png(path, rows, w, h):
+    def chunk(tag, payload):
+        return (struct.pack(">I", len(payload)) + tag + payload +
+                struct.pack(">I", zlib.crc32(tag + payload) & 0xffffffff))
+
+    raw = b"".join(b"\x00" + row for row in rows)
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) +
+           chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+    Path(path).write_bytes(png)
+
+
+def main():
+    if len(sys.argv) < 3:
+        print(__doc__)
+        sys.exit(2)
+    src, dst = Path(sys.argv[1]), Path(sys.argv[2])
+    w = h = None
+    for i, arg in enumerate(sys.argv):
+        if arg == "--width":
+            w = int(sys.argv[i + 1])
+        elif arg == "--height":
+            h = int(sys.argv[i + 1])
+    if w is None or h is None:
+        print("error: --width/--height required", file=sys.stderr)
+        sys.exit(2)
+
+    data = src.read_bytes()
+    frame_size = w * h * 3 // 2
+    n_frames = len(data) // frame_size
+    if n_frames == 0:
+        print(f"error: file too small for one {w}x{h} NV12 frame", file=sys.stderr)
+        sys.exit(1)
+
+    for i in range(n_frames):
+        frame = data[i * frame_size:(i + 1) * frame_size]
+        rows, nonzero = nv12_to_rgb(frame, w, h)
+        if nonzero == 0:
+            print(f"WARNING: frame {i} is ALL ZERO (ISP pipeline broken)")
+        out = dst if n_frames == 1 else dst.with_name(f"{dst.stem}-{i}{dst.suffix}")
+        write_png(out, rows, w, h)
+        print(f"frame {i}: {out} ({w}x{h}, nonzero_pixels={nonzero})")
+
+
+if __name__ == "__main__":
+    main()

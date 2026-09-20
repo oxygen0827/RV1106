@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# 部署 GC1084 彩色 IQ 变体并验证 ISP 输出是否恢复彩色
+#
+# 背景：当前板端 IQ 文件 gc1084_SV-SMSM50S_80IR-F20 是 80IR 红外标定
+# （colorAsGrey=1 强制灰度）。本脚本替换为彩色变体并抓帧验证 U/V 色度。
+#
+# 用法: scripts/deploy-gc1084-color-iq <v1|v2> [--no-restore]
+#   v1 : 官方建议最小改动（只关 colorAsGrey，可能偏色但有色）
+#   v2 : 借 sc4336 彩色标定的 AWB/CCM 数据（开关全改彩色）
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+IQ_DIR="${PROJECT_DIR}/out/gc1084-build/iq-color"
+REMOTE_IQ=/etc/iqfiles/gc1084_SV-SMSM50S_80IR-F20.json
+TARGET_NAME=gc1084_SV-SMSM50S_80IR-F20.json
+VARIANT="${1:-}"
+RESTORE_DESKBOT=1
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/deploy-gc1084-color-iq <v1|v2> [--no-restore]
+
+部署彩色 IQ 变体到板端 /etc/iqfiles 并抓帧验证：
+  v1 : 只关 colorAsGrey（官方建议最小改动）
+  v2 : 借 sc4336 彩色标定的 AWB/CCM（完整彩色开关）
+EOF
+}
+
+[[ "$VARIANT" == v1 || "$VARIANT" == v2 ]] || { usage >&2; exit 2; }
+[[ "${2:-}" == "--no-restore" ]] && RESTORE_DESKBOT=0
+
+if ! adb devices | grep -qw device; then
+  echo "error: no ADB device (板子离线，插上板子后重试)" >&2
+  exit 1
+fi
+
+case "$VARIANT" in
+  v1) SRC="${IQ_DIR}/gc1084_SV-SMSM50S_80IR-F20.v1.json" ;;
+  v2) SRC="${IQ_DIR}/gc1084_color_v2.json" ;;
+esac
+test -f "$SRC" || { echo "error: 缺少 $SRC" >&2; exit 1; }
+
+echo "=== 1. 备份板端当前 IQ 文件 ==="
+adb shell "cp ${REMOTE_IQ} ${REMOTE_IQ}.bak 2>/dev/null || true"
+adb pull "${REMOTE_IQ}" "${PROJECT_DIR}/out/gc1084-build/iq-color/board-iq-backup.json" >/dev/null 2>&1 || true
+
+echo "=== 2. 部署 ${VARIANT} 变体 ==="
+adb push "$SRC" "${REMOTE_IQ}" >/dev/null
+# /oem 下也放一份（若 DeskBot 从那里读）
+adb shell "cp ${REMOTE_IQ} /oem/usr/share/iqfiles/${TARGET_NAME} 2>/dev/null || true"
+adb shell "ls -la ${REMOTE_IQ} ${REMOTE_IQ}.bak"
+
+echo "=== 3. 停 DeskBot（释放 ISP）==="
+deskbot_was_running=0
+if adb shell 'pidof main >/dev/null 2>&1'; then
+  deskbot_was_running=1
+  adb shell 'start-stop-daemon -K -x /root/bin/main -R 3 >/dev/null 2>&1 || true'
+  echo "DeskBot 已停止"
+else
+  echo "DeskBot 未运行"
+fi
+
+cleanup() {
+  adb shell "killall rkaiq_3A_server 2>/dev/null || true"
+  if [[ "$RESTORE_DESKBOT" -eq 1 && "$deskbot_was_running" -eq 1 ]]; then
+    adb shell 'cd /root/bin && start-stop-daemon -S -b -x /root/bin/main' >/dev/null 2>&1 || true
+    echo "DeskBot 已重启（屏幕画面应变为彩色）"
+  fi
+}
+trap cleanup EXIT
+
+echo "=== 4. 抓帧验证彩色（AE 收敛后取 3 帧）==="
+adb shell '
+  killall rkaiq_3A_server 2>/dev/null || true
+  export LD_LIBRARY_PATH=/root/gc1084-isp-kit:/oem/usr/lib:/usr/lib
+  /root/gc1084-isp-kit/rkaiq_3A_server > /tmp/3a-color.log 2>&1 &
+  SVPID=$!
+  sleep 4
+  rm -f /tmp/color-check.nv12
+  v4l2-ctl -d /dev/video11 --set-fmt-video=width=1280,height=720,pixelformat=NV12 \
+      --stream-mmap=4 --stream-skip=90 --stream-count=3 --stream-to=/tmp/color-check.nv12 \
+      > /tmp/color-check.log 2>&1
+  kill $SVPID 2>/dev/null
+  ls -la /tmp/color-check.nv12
+' | tr -d '\r'
+
+mkdir -p "${PROJECT_DIR}/out/gc1084-build/iq-color"
+adb pull /tmp/color-check.nv12 "${PROJECT_DIR}/out/gc1084-build/iq-color/color-check.nv12" >/dev/null 2>&1 || true
+
+echo "=== 5. 色度分析 ==="
+python3 - <<PY
+import statistics
+try:
+    raw = open('${PROJECT_DIR}/out/gc1084-build/iq-color/color-check.nv12','rb').read()
+except FileNotFoundError:
+    print("未取到帧文件，检查板端 3a-color.log / color-check.log")
+    raise SystemExit(1)
+W,H=1280,720; fs=W*H*3//2
+n=len(raw)//fs
+print(f"frames={n}")
+color = False
+for i in range(n):
+    y=raw[i*fs:i*fs+W*H]; uv=raw[i*fs+W*H:(i+1)*fs]
+    u=uv[0::2]; v=uv[1::2]
+    um=statistics.mean(u); vm=statistics.mean(v)
+    us=statistics.pstdev(u); vs=statistics.pstdev(v)
+    print(f"frame{i}: Y mean={statistics.mean(y):.1f} | U={um:.1f}(std {us:.1f}) V={vm:.1f}(std {vs:.1f})")
+    if us > 2.0 or vs > 2.0 or abs(um-128) > 3 or abs(vm-128) > 3:
+        color = True
+if color:
+    print("=> 彩色恢复成功！U/V 不再中性")
+else:
+    print("=> 仍然黑白（U/V 中性），尝试另一个变体")
+PY

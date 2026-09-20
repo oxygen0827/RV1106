@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# 部署并运行 camera_yolo（实时 YOLO）
+#
+# 流程：构建（可选）→ 推送 → 启动 rkaiq_3A_server → 运行 camera_yolo
+# 取流 /dev/video11（ISP mainpath NV12），帧落盘到 /data/camera-yolo-frames。
+#
+# 用法: scripts/deploy-camera-yolo [--no-build] [--count N] [--device /dev/videoXX]
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PACKAGE_DIR="${PROJECT_DIR}/out/camera-yolo"
+ISP_KIT="${PROJECT_DIR}/out/gc1084-build/isp-kit"
+REMOTE_DIR=/root/camera-yolo
+REMOTE_KIT=/root/gc1084-isp-kit
+REMOTE_FRAMES=/tmp/camera-yolo-frames
+COUNT=50
+DEVICE=/dev/video11
+build=1
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/deploy-camera-yolo [--no-build] [--count N] [--device /dev/videoXX]
+
+Builds, deploys, and runs camera_yolo against the ISP mainpath. The rkaiq 3A
+server is started from the ISP kit before inference and stopped afterwards.
+Frames are dumped to /data/camera-yolo-frames for host-side verification.
+EOF
+}
+
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --no-build) build=0 ;;
+    --count) COUNT="$2"; shift ;;
+    --device) DEVICE="$2"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if ! [[ "$COUNT" =~ ^[0-9]+$ && "$COUNT" -gt 0 ]]; then
+  echo "error: --count must be a positive integer" >&2
+  exit 2
+fi
+
+if ! adb devices | grep -qw device; then
+  echo "error: no ADB device (board offline?)" >&2
+  exit 1
+fi
+
+if [[ "$build" -eq 1 ]]; then
+  "${SCRIPT_DIR}/build-camera-yolo"
+fi
+test -x "${PACKAGE_DIR}/camera_yolo"
+test -f "${PACKAGE_DIR}/model/yolov5.rknn"
+
+adb shell "mkdir -p ${REMOTE_DIR} ${REMOTE_FRAMES} ${REMOTE_KIT}" >/dev/null
+adb push "${PACKAGE_DIR}/." "${REMOTE_DIR}/" >/dev/null
+adb shell "chmod 0755 ${REMOTE_DIR}/camera_yolo"
+# 确保 3A server 与 librkaiq 就位
+adb push "${ISP_KIT}/rkaiq_3A_server" "${ISP_KIT}/librkaiq.so" "${ISP_KIT}/libsmartIr.so" "${REMOTE_KIT}/" >/dev/null 2>&1 || true
+adb shell "mkdir -p /etc/iqfiles" >/dev/null
+adb push "${ISP_KIT}/gc1084_SV-SMSM50S_80IR-F20.json" "${ISP_KIT}/gc1084_SV-SMSM50S_80IR-F20.bin" /etc/iqfiles/ >/dev/null
+
+# DeskBot（/root/bin/main）可能占用摄像头，测试期间停掉，结束恢复
+deskbot_was_running=0
+if adb shell 'pidof main >/dev/null 2>&1'; then
+  deskbot_was_running=1
+  echo "stopping DeskBot for the duration of the test"
+  adb shell 'start-stop-daemon -K -x /root/bin/main -R 3 >/dev/null 2>&1 || true'
+fi
+
+cleanup() {
+  adb shell "killall rkaiq_3A_server 2>/dev/null || true"
+  if [[ "${deskbot_was_running}" -eq 1 ]]; then
+    adb shell 'cd /root/bin && start-stop-daemon -S -b -x /root/bin/main' >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+# 推板端 runner（3A server + camera_yolo 同一会话）
+adb push "${SCRIPT_DIR}/board/gc1084-yolo-run.sh" /root/gc1084-yolo-run.sh >/dev/null
+adb shell "chmod 0755 /root/gc1084-yolo-run.sh"
+
+echo "running camera_yolo: model=yolov5.rknn device=${DEVICE} count=${COUNT}"
+set +e
+adb shell "KIT=${REMOTE_KIT} APP=${REMOTE_DIR} OUT=${REMOTE_FRAMES} /root/gc1084-yolo-run.sh ${COUNT} ${DEVICE}" 2>&1 \
+  | tr -d '\r' | tee "${PROJECT_DIR}/out/camera-yolo-run.log"
+adb_status=${PIPESTATUS[0]}
+set -e
+if [[ "$adb_status" -ne 0 ]]; then
+  echo "warning: adb shell exited with ${adb_status}" >&2
+fi
+
+echo "pulling frame dumps to ${PROJECT_DIR}/out/camera-yolo-frames/"
+mkdir -p "${PROJECT_DIR}/out/camera-yolo-frames"
+adb pull "${REMOTE_FRAMES}/." "${PROJECT_DIR}/out/camera-yolo-frames/" >/dev/null 2>&1 || true
+echo "3A server log:"
+adb shell "tail -20 /root/3a-server.log" | tr -d '\r' || true
+echo "done"

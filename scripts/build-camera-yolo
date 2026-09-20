@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# 构建 camera_yolo（实时 YOLO：V4L2 ISP NV12 → RGA letterbox → RKNN）
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+BUILD_DIR=/workspace/build/echo-mate-camera-yolo
+INSTALL_DIR=/workspace/install/echo-mate-camera-yolo
+HOST_OUTPUT="${PROJECT_DIR}/out/camera-yolo"
+
+mkdir -p "${HOST_OUTPUT}"
+
+docker compose -f "${PROJECT_DIR}/compose.yaml" run --rm sdk bash -lc "
+  set -euo pipefail
+  cmake \
+    -S /host-project/apps/camera-yolo \
+    -B ${BUILD_DIR} \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_TOOLCHAIN_FILE=/host-project/apps/camera-yolo/cmake/rv1106-toolchain.cmake \
+    -DCMAKE_INSTALL_PREFIX=${INSTALL_DIR}
+  cmake --build ${BUILD_DIR} --parallel 4
+  cmake --install ${BUILD_DIR}
+"
+
+docker compose -f "${PROJECT_DIR}/compose.yaml" run --rm \
+  -v "${HOST_OUTPUT}:/export" sdk bash -lc "
+    set -euo pipefail
+    cp -a ${INSTALL_DIR}/. /export/
+  "
+
+echo "camera-yolo package: ${HOST_OUTPUT}"

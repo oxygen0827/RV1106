@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PACKAGE_DIR="${PROJECT_DIR}/out/yolo-smoke"
+REMOTE_DIR=/root/yolo-smoke
+RUNS="${RUNS:-3}"
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/deploy-yolo-smoke [--no-build]
+
+Builds, deploys, and runs the bundled YOLOv5 RKNN model against bus.jpg.
+The package is installed separately under /root/yolo-smoke; /root/bin is not
+overwritten. DeskBot is stopped only while the one-shot NPU test runs.
+EOF
+}
+
+build=1
+case "${1:-}" in
+  "") ;;
+  --no-build) build=0 ;;
+  -h|--help) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+if ! adb devices | grep -qw device; then
+  echo "error: no ADB device" >&2
+  exit 1
+fi
+
+if [[ "${build}" -eq 1 ]]; then
+  "${SCRIPT_DIR}/build-yolo-smoke"
+fi
+test -x "${PACKAGE_DIR}/yolo_smoke"
+test -f "${PACKAGE_DIR}/model/yolov5.rknn"
+
+adb shell "mkdir -p ${REMOTE_DIR}"
+adb push "${PACKAGE_DIR}/." "${REMOTE_DIR}/" >/dev/null
+adb shell "chmod 0755 ${REMOTE_DIR}/yolo_smoke"
+
+deskbot_was_running=0
+if adb shell 'pidof main >/dev/null 2>&1'; then
+  deskbot_was_running=1
+  adb shell 'start-stop-daemon -K -x /root/bin/main -R 3 >/dev/null 2>&1 || true'
+fi
+
+restore_deskbot() {
+  if [[ "${deskbot_was_running}" -eq 1 ]]; then
+    adb shell 'cd /root/bin && start-stop-daemon -S -b -x /root/bin/main' >/dev/null 2>&1 || true
+    sleep 1
+    if ! adb shell 'pidof main >/dev/null 2>&1'; then
+      echo "warning: DeskBot did not restart after YOLO smoke test" >&2
+    fi
+  fi
+}
+trap restore_deskbot EXIT
+
+remote_status_file="$(mktemp)"
+trap 'rm -f "${remote_status_file}"; restore_deskbot' EXIT
+set +e
+adb shell "cd ${REMOTE_DIR} && ./yolo_smoke ./model/yolov5.rknn ./model/bus.jpg ${RUNS}; printf '%s' \"\$?\" > /tmp/yolo-smoke.status" 2>&1 \
+  | tr -d '\r' | tee "${PROJECT_DIR}/out/yolo-smoke-image.log"
+adb_status=${PIPESTATUS[0]}
+set -e
+adb pull /tmp/yolo-smoke.status "${remote_status_file}" >/dev/null 2>&1 || true
+adb shell 'rm -f /tmp/yolo-smoke.status' >/dev/null 2>&1 || true
+remote_status="$(tr -d '\r\n' < "${remote_status_file}")"
+if [[ "${adb_status}" -ne 0 || ! "${remote_status}" =~ ^[0-9]+$ || "${remote_status}" -ne 0 ]]; then
+  echo "error: YOLO smoke test failed (adb=${adb_status}, remote=${remote_status:-missing})" >&2
+  exit 1
+fi

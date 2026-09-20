@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+project_dir=$(cd "${script_dir}/.." && pwd)
+
+runtime_env=${AICHAT_RUNTIME_ENV:-${project_dir}/tmp/aichat-server/runtime.env}
+server_dir=${AICHAT_SERVER_DIR:-${project_dir}/upstream/Demo4Echo/AIChat_demo/Server}
+python_bin=${AICHAT_PYTHON:-${project_dir}/tmp/aichat-server/bin/python}
+
+file_mode() {
+  stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null
+}
+
+if [[ ! -f "${runtime_env}" ]]; then
+  printf 'AIChat runtime env not found: %s\n' "${runtime_env}" >&2
+  exit 1
+fi
+
+if [[ $(file_mode "${runtime_env}") != 600 ]]; then
+  printf 'AIChat runtime env must have mode 600: %s\n' "${runtime_env}" >&2
+  exit 1
+fi
+
+if [[ ! -x "${python_bin}" || ! -f "${server_dir}/main.py" ]]; then
+  printf 'AIChat server runtime is incomplete\n' >&2
+  exit 1
+fi
+
+set -a
+# runtime.env is a private, owner-writable deployment file.
+source "${runtime_env}"
+set +a
+
+: "${AICHAT_ACCESS_TOKEN:?AICHAT_ACCESS_TOKEN is required}"
+: "${ZHIPU_API_KEY:?ZHIPU_API_KEY is required}"
+
+if [[ ! ${AICHAT_ACCESS_TOKEN} =~ ^[A-Za-z0-9_-]{32,64}$ ]]; then
+  printf 'AICHAT_ACCESS_TOKEN must be 32-64 URL-safe characters\n' >&2
+  exit 1
+fi
+
+cd "${server_dir}"
+exec "${python_bin}" main.py

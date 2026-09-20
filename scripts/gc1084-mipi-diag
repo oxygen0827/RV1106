@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# GC1084 MIPI 链路稳定性诊断（宿主侧）
+#
+# 用法: scripts/gc1084-mipi-diag [frames-per-round] [rounds]
+# 推送板端脚本并执行，拉回每轮帧文件与 rkcif 统计。
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REMOTE_OUT=/tmp/gc1084-mipi
+HOST_OUT="${PROJECT_DIR}/out/gc1084-build/mipi-diag"
+
+FRAMES="${1:-30}"
+ROUNDS="${2:-3}"
+if ! [[ "$FRAMES" =~ ^[0-9]+$ && "$ROUNDS" =~ ^[0-9]+$ ]]; then
+  echo "usage: scripts/gc1084-mipi-diag [frames] [rounds]" >&2
+  exit 2
+fi
+
+if ! adb devices | grep -qw device; then
+  echo "error: no ADB device (board offline?)" >&2
+  exit 1
+fi
+
+adb shell "mkdir -p ${REMOTE_OUT}" >/dev/null
+adb push "${SCRIPT_DIR}/board/gc1084-mipi-diag.sh" /data/gc1084-mipi-diag.sh >/dev/null
+adb shell "chmod 0755 /data/gc1084-mipi-diag.sh"
+
+# DeskBot（/root/bin/main）可能占用 /dev/video0，测试期间停掉，结束恢复
+deskbot_was_running=0
+if adb shell 'pidof main >/dev/null 2>&1'; then
+  deskbot_was_running=1
+  echo "stopping DeskBot for the duration of the test"
+  adb shell 'start-stop-daemon -K -x /root/bin/main -R 3 >/dev/null 2>&1 || true'
+fi
+restore_deskbot() {
+  if [[ "${deskbot_was_running}" -eq 1 ]]; then
+    adb shell 'cd /root/bin && start-stop-daemon -S -b -x /root/bin/main' >/dev/null 2>&1 || true
+  fi
+}
+trap restore_deskbot EXIT
+
+echo "running MIPI diagnostic: ${ROUNDS} rounds x ${FRAMES} frames"
+mkdir -p "${HOST_OUT}"
+adb shell "/data/gc1084-mipi-diag.sh ${FRAMES} ${ROUNDS}" 2>&1 \
+  | tr -d '\r' | tee "${PROJECT_DIR}/out/gc1084-build/mipi-diag.log"
+
+echo "pulling results to ${HOST_OUT}/"
+adb pull "${REMOTE_OUT}/." "${HOST_OUT}/" >/dev/null 2>&1 || true
+echo "done"

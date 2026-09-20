@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/sync-aichat-token ENV_FILE [ADB_SERIAL] [REMOTE_CONFIG]
+
+Atomically copy AICHAT_ACCESS_TOKEN from a private env file to the board's
+AIChat_server_token setting without exposing the token in process arguments.
+EOF
+}
+
+if [[ $# -lt 1 || $# -gt 3 ]]; then
+  usage >&2
+  exit 2
+fi
+
+env_file=$1
+adb_serial=${2:-}
+remote_config=${3:-/root/bin/system_para.conf}
+
+file_mode() {
+  stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null
+}
+
+if [[ ! -f "${env_file}" ]]; then
+  printf 'Runtime env file not found: %s\n' "${env_file}" >&2
+  exit 1
+fi
+
+if [[ $(file_mode "${env_file}") != 600 ]]; then
+  printf 'Runtime env file must have mode 600: %s\n' "${env_file}" >&2
+  exit 1
+fi
+
+set -a
+# Use the same trusted, owner-only shell environment format as the launcher.
+source "${env_file}"
+set +a
+access_token=${AICHAT_ACCESS_TOKEN:-}
+
+if [[ ! ${access_token} =~ ^[A-Za-z0-9_-]{32,64}$ ]]; then
+  printf 'AICHAT_ACCESS_TOKEN must be 32-64 URL-safe characters\n' >&2
+  exit 1
+fi
+
+adb_args=()
+if [[ -n "${adb_serial}" ]]; then
+  adb_args=(-s "${adb_serial}")
+fi
+
+umask 077
+local_token_file=$(mktemp /private/tmp/echo-mate-aichat-token.XXXXXX)
+remote_token_file="/tmp/codex-aichat-token-line.$$"
+
+cleanup() {
+  rm -f "${local_token_file}"
+  adb "${adb_args[@]}" shell rm -f "${remote_token_file}" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT HUP INT TERM
+
+printf 'AIChat_server_token=%s\n' "${access_token}" > "${local_token_file}"
+unset access_token AICHAT_ACCESS_TOKEN
+
+adb "${adb_args[@]}" push "${local_token_file}" "${remote_token_file}" >/dev/null
+adb "${adb_args[@]}" exec-out sh -s -- "${remote_token_file}" "${remote_config}" <<'REMOTE'
+set -eu
+
+token_file=$1
+config=$2
+new_config="${config}.codex-new"
+backup_config="${config}.before-aichat-token"
+app_binary="$(dirname "${config}")/main"
+
+cleanup() {
+  rm -f "${new_config}" "${token_file}"
+}
+trap cleanup EXIT HUP INT TERM
+
+test -f "${config}"
+test "$(wc -l < "${token_file}")" -eq 1
+token_chars=$(awk '
+  /^AIChat_server_token=/ {
+    print length(substr($0, index($0, "=") + 1))
+  }
+' "${token_file}")
+test "${token_chars:-0}" -ge 32
+test "${token_chars}" -le 64
+
+deskbot_is_running() {
+  for process_dir in /proc/[0-9]*; do
+    process_exe=$(readlink "${process_dir}/exe" 2>/dev/null || true)
+    case "${process_exe}" in
+      "${app_binary}"|"${app_binary} (deleted)") return 0 ;;
+    esac
+  done
+  return 1
+}
+
+if deskbot_is_running; then
+  printf 'DeskBot is running; stop it before synchronizing the token\n' >&2
+  exit 3
+fi
+
+if [ ! -e "${backup_config}" ]; then
+  cp -p "${config}" "${backup_config}"
+fi
+chmod 600 "${backup_config}"
+
+awk '
+  NR == FNR {
+    replacement = $0
+    next
+  }
+  /^AIChat_server_token=/ {
+    $0 = replacement
+    replacements++
+  }
+  { print }
+  END {
+    if (replacements != 1) exit 2
+  }
+' "${token_file}" "${config}" > "${new_config}"
+
+chmod 600 "${new_config}"
+if deskbot_is_running; then
+  printf 'DeskBot started during token synchronization; refusing update\n' >&2
+  exit 3
+fi
+mv "${new_config}" "${config}"
+chmod 600 "${config}"
+rm -f "${token_file}"
+trap - EXIT HUP INT TERM
+
+printf 'Board AIChat access token synchronized; chars=%s\n' "${token_chars}"
+REMOTE

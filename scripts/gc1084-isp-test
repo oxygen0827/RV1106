@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# GC1084 ISP 通路测试（宿主侧：推送工具包 → 板端执行 → 拉回结果）
+#
+# 用法: scripts/gc1084-isp-test [demo|v4l2] [frame-count] [--no-push]
+#   demo : rkisp_demo 直连 ISP mainpath（默认）
+#   v4l2 : rkaiq_3A_server + v4l2-ctl 抓 ISP mainpath
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+KIT="${PROJECT_DIR}/out/gc1084-build/isp-kit"
+# /data(=userdata) 只有 2.2MB 放不下工具包；kit 放 /root（rootfs 28MB 可用），
+# 结果/帧文件放 /tmp（27MB tmpfs）
+REMOTE_KIT=/root/gc1084-isp-kit
+REMOTE_OUT=/tmp/gc1084-isp
+HOST_OUT="${PROJECT_DIR}/out/gc1084-build/isp-results"
+
+MODE="${1:-demo}"
+COUNT="${2:-10}"
+push=1
+case "${3:-}" in
+  --no-push) push=0 ;;
+  "") ;;
+  *) echo "unknown arg: $3" >&2; exit 2 ;;
+esac
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/gc1084-isp-test [demo|v4l2] [frame-count] [--no-push]
+
+Tests the GC1084 ISP path on the board and pulls NV12 frames + diagnostics.
+Requires: ADB device online; out/gc1084-build/isp-kit/ packaged
+(scripts are packaged by scripts/gc1084-isp-test directly from the SDK).
+EOF
+}
+
+if [[ "$MODE" != demo && "$MODE" != v4l2 ]]; then
+  usage >&2
+  exit 2
+fi
+
+if ! adb devices | grep -qw device; then
+  echo "error: no ADB device (board offline?)" >&2
+  exit 1
+fi
+for f in rkisp_demo rkaiq_3A_server librkaiq.so; do
+  test -f "${KIT}/${f}" || { echo "error: missing ${KIT}/${f}" >&2; exit 1; }
+done
+
+if [[ "$push" -eq 1 ]]; then
+  echo "pushing ISP kit to ${REMOTE_KIT} ..."
+  adb shell "mkdir -p ${REMOTE_KIT} ${REMOTE_OUT}" >/dev/null
+  adb push "${KIT}/." "${REMOTE_KIT}/" >/dev/null
+  adb push "${SCRIPT_DIR}/board/gc1084-isp-test.sh" /data/gc1084-isp-test.sh >/dev/null
+  adb shell "chmod 0755 /data/gc1084-isp-test.sh"
+fi
+
+# DeskBot（/root/bin/main）可能占用摄像头/3A，测试期间停掉，结束恢复
+deskbot_was_running=0
+if adb shell 'pidof main >/dev/null 2>&1'; then
+  deskbot_was_running=1
+  echo "stopping DeskBot for the duration of the test"
+  adb shell 'start-stop-daemon -K -x /root/bin/main -R 3 >/dev/null 2>&1 || true'
+fi
+restore_deskbot() {
+  if [[ "${deskbot_was_running}" -eq 1 ]]; then
+    adb shell 'cd /root/bin && start-stop-daemon -S -b -x /root/bin/main' >/dev/null 2>&1 || true
+  fi
+}
+trap restore_deskbot EXIT
+
+echo "running board-side ISP test: mode=${MODE} count=${COUNT}"
+mkdir -p "${HOST_OUT}"
+adb shell "/data/gc1084-isp-test.sh ${MODE} ${COUNT}" 2>&1 \
+  | tr -d '\r' | tee "${PROJECT_DIR}/out/gc1084-build/isp-${MODE}.log"
+
+echo "pulling results to ${HOST_OUT}/"
+adb pull "${REMOTE_OUT}/." "${HOST_OUT}/" >/dev/null 2>&1 || true
+echo "done"
